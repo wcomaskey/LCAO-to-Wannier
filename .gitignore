@@ -49,3 +49,7 @@ tests/*.eig
 examples/*.amn
 examples/*.mmn
 examples/*.eig
+
+*.amn
+*.mmn
+*.eig

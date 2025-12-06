@@ -1,13 +1,16 @@
 """
 Utility Functions Module
 
-This module contains helper functions for data format conversion
-and other utility operations.
+This module contains helper functions for data format conversion,
+matrix organization, and rigorous symmetry checking.
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
+# ==============================
+# Data Preparation & Conversion
+# ==============================
 
 def prepare_real_space_matrices(
     H_full_list: List[Tuple[np.ndarray, np.ndarray]],
@@ -15,37 +18,29 @@ def prepare_real_space_matrices(
     lattice_vectors: np.ndarray
 ) -> Dict[Tuple[int, int, int], Dict[str, np.ndarray]]:
     """
-    Convert from parsed format to the format expected by Wannier90Engine.
-    
-    Converts from (R_cartesian, matrix) format to (R_integer, matrix) format.
+    Convert from parsed (Cartesian) format to the (Integer) lattice format
+    expected by the main engine.
     
     Parameters
     ----------
-    H_full_list : list of tuples
-        List of (R_cartesian, H_matrix) tuples from parsing
-    S_full_list : list of tuples
-        List of (R_cartesian, S_matrix) tuples from parsing
-    lattice_vectors : ndarray of shape (3, 3)
-        Real-space lattice vectors (rows are vectors)
+    H_full_list : list
+        List of (R_cartesian, H_matrix) from parser
+    S_full_list : list
+        List of (R_cartesian, S_matrix) from parser
+    lattice_vectors : ndarray
+        3x3 matrix of real-space lattice vectors
     
     Returns
     -------
     real_space_matrices : dict
-        Maps (R1, R2, R3) -> {'H': H_matrix, 'S': S_matrix}
-        where (R1, R2, R3) are integer lattice coordinates
-    
-    Examples
-    --------
-    >>> H_list = [(R_cart1, H1), (R_cart2, H2)]
-    >>> S_list = [(R_cart1, S1), (R_cart2, S2)]
-    >>> matrices = prepare_real_space_matrices(H_list, S_list, lattice_vectors)
+        Maps (n1, n2, n3) -> {'H': H_matrix, 'S': S_matrix}
     """
     real_space_matrices = {}
     
     # Process Hamiltonian matrices
     for R_cartesian, H_matrix in H_full_list:
-        # Convert Cartesian coordinates to lattice coordinates
-        # Solve: R_cartesian = R_integer @ lattice_vectors
+        # Solve R_cart = n * A to find integers n
+        # Rounding is necessary due to floating point noise
         R_integer = np.round(np.linalg.solve(lattice_vectors.T, R_cartesian)).astype(int)
         R_tuple = tuple(R_integer)
         
@@ -55,7 +50,6 @@ def prepare_real_space_matrices(
     
     # Process overlap matrices
     for R_cartesian, S_matrix in S_full_list:
-        # Convert Cartesian coordinates to lattice coordinates
         R_integer = np.round(np.linalg.solve(lattice_vectors.T, R_cartesian)).astype(int)
         R_tuple = tuple(R_integer)
         
@@ -71,22 +65,10 @@ def organize_matrices_by_lattice_vector(
 ) -> Tuple[Dict[Tuple[int, int, int], Dict[str, np.ndarray]], 
            Dict[Tuple[int, int, int], np.ndarray]]:
     """
-    Organize parsed matrices by lattice vector.
+    Organize raw parsed matrix blocks by lattice vector and spin channel.
     
-    Separates overlap and Fock matrices and organizes them by
-    their lattice vectors and spin channels.
-    
-    Parameters
-    ----------
-    matrices : list of dict
-        Parsed matrix information from parser
-    
-    Returns
-    -------
-    H_R_dict : dict
-        Maps (R1, R2, R3) -> {spin_channel: H_matrix}
-    S_R_dict : dict
-        Maps (R1, R2, R3) -> S_matrix
+    This bridges the gap between 'parse_overlap_and_fock_matrices' and
+    'create_spin_block_matrices'.
     """
     H_R_dict = {}
     S_R_dict = {}
@@ -96,6 +78,9 @@ def organize_matrices_by_lattice_vector(
         lattice_vector = tuple(matrix_info['lattice_vector'])
         data = matrix_info['data']
         
+        if data is None:
+            continue
+            
         if matrix_type == 'overlap':
             S_R_dict[lattice_vector] = data
         elif matrix_type == 'fock':
@@ -108,39 +93,109 @@ def organize_matrices_by_lattice_vector(
 
 
 def get_basis_size(matrices_dict: dict) -> int:
-    """
-    Get the basis size from the matrices dictionary.
-    
-    Parameters
-    ----------
-    matrices_dict : dict
-        Dictionary containing matrices
-    
-    Returns
-    -------
-    int
-        Number of basis functions
-    """
+    """Get the basis size (N) from the matrices dictionary."""
+    if not matrices_dict:
+        return 0
     first_key = next(iter(matrices_dict))
-    return matrices_dict[first_key].shape[0]
+    
+    if 'H' in matrices_dict[first_key]:
+        # H is 2N x 2N, we want N (spatial orbitals)
+        return matrices_dict[first_key]['H'].shape[0] // 2
+    elif 'ALPHA_ALPHA' in matrices_dict[first_key]:
+        # Raw dict is N x N
+        return matrices_dict[first_key]['ALPHA_ALPHA'].shape[0]
+    return 0
+
+
+# ==============================
+# Verification & Diagnostics
+# ==============================
+
+def verify_matrix_symmetry(
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    tolerance: float = 1e-10
+) -> bool:
+    """
+    Verify that the constructed matrices satisfy the fundamental physical symmetries:
+    1. H(0) is Hermitian.
+    2. H(R) = H(-R)†
+    3. S(R) = S(-R)^T
+    
+    Returns True if all checks pass.
+    """
+    print("\n" + "-" * 60)
+    print("VERIFYING MATRIX SYMMETRY AND HERMITICITY")
+    print("-" * 60)
+    
+    all_passed = True
+    max_error_H = 0.0
+    max_error_S = 0.0
+    
+    # Check Origin
+    origin = (0, 0, 0)
+    if origin in real_space_matrices:
+        mats = real_space_matrices[origin]
+        if 'H' in mats:
+            # Check H(0) == H(0)†
+            diff = np.max(np.abs(mats['H'] - mats['H'].conj().T))
+            if diff > tolerance:
+                print(f"FAIL: Origin H(0) is not Hermitian. Max Diff: {diff:.2e}")
+                all_passed = False
+            max_error_H = max(max_error_H, diff)
+            
+    # Check Pairs
+    checked_R = set()
+    for R in real_space_matrices:
+        if R == (0, 0, 0) or R in checked_R:
+            continue
+            
+        minus_R = tuple(-x for x in R)
+        if minus_R not in real_space_matrices:
+            print(f"WARNING: pair {minus_R} missing for {R}")
+            continue
+            
+        # Check Hamiltonian: H(R) - H(-R)† == 0
+        if 'H' in real_space_matrices[R] and 'H' in real_space_matrices[minus_R]:
+            H_R = real_space_matrices[R]['H']
+            H_mR = real_space_matrices[minus_R]['H']
+            
+            diff = np.max(np.abs(H_R - H_mR.conj().T))
+            max_error_H = max(max_error_H, diff)
+            
+            if diff > tolerance:
+                print(f"FAIL H: Pair {R}/{minus_R} symmetry violation. Diff: {diff:.2e}")
+                all_passed = False
+
+        # Check Overlap: S(R) - S(-R)^T == 0 (Transpose only, S is real)
+        if 'S' in real_space_matrices[R] and 'S' in real_space_matrices[minus_R]:
+            S_R = real_space_matrices[R]['S']
+            S_mR = real_space_matrices[minus_R]['S']
+            
+            diff = np.max(np.abs(S_R - S_mR.T))
+            max_error_S = max(max_error_S, diff)
+            
+            if diff > tolerance:
+                print(f"FAIL S: Pair {R}/{minus_R} symmetry violation. Diff: {diff:.2e}")
+                all_passed = False
+
+        checked_R.add(R)
+        checked_R.add(minus_R)
+
+    print(f"Max Symmetry Error H: {max_error_H:.2e}")
+    print(f"Max Symmetry Error S: {max_error_S:.2e}")
+    
+    if all_passed:
+        print("SUCCESS: All matrix symmetries are satisfied.")
+    else:
+        print("FAILURE: Matrix symmetries violated.")
+        
+    return all_passed
 
 
 def check_matrix_consistency(
     real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]]
 ) -> bool:
-    """
-    Check that all matrices have consistent dimensions.
-    
-    Parameters
-    ----------
-    real_space_matrices : dict
-        Dictionary of real-space matrices
-    
-    Returns
-    -------
-    bool
-        True if all matrices are consistent
-    """
+    """Check that all matrices have consistent dimensions (square and equal size)."""
     sizes = []
     
     for R_tuple, matrices in real_space_matrices.items():
@@ -165,17 +220,14 @@ def check_matrix_consistency(
     return True
 
 
+# ==============================
+# Reporting
+# ==============================
+
 def print_matrix_summary(
     real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]]
 ) -> None:
-    """
-    Print a summary of the real-space matrices.
-    
-    Parameters
-    ----------
-    real_space_matrices : dict
-        Dictionary of real-space matrices
-    """
+    """Print a summary of the real-space matrices."""
     print("\n" + "=" * 70)
     print("Real-Space Matrices Summary")
     print("=" * 70)
@@ -183,10 +235,12 @@ def print_matrix_summary(
     num_R_vectors = len(real_space_matrices)
     print(f"Number of R-vectors: {num_R_vectors}")
     
-    # Get matrix size
-    first_key = next(iter(real_space_matrices))
-    num_orbitals = real_space_matrices[first_key]['H'].shape[0]
-    print(f"Matrix size: {num_orbitals} × {num_orbitals}")
+    if num_R_vectors > 0:
+        # Get matrix size
+        first_key = next(iter(real_space_matrices))
+        if 'H' in real_space_matrices[first_key]:
+            dim = real_space_matrices[first_key]['H'].shape[0]
+            print(f"Hamiltonian Dimension: {dim} × {dim}")
     
     # List R-vectors
     print("\nR-vectors:")
@@ -198,69 +252,13 @@ def print_matrix_summary(
     print("=" * 70)
 
 
-def estimate_memory_usage(
-    num_kpoints: int,
-    num_orbitals: int,
-    num_wann: int
-) -> dict:
-    """
-    Estimate memory usage for the calculation.
-    
-    Parameters
-    ----------
-    num_kpoints : int
-        Number of k-points
-    num_orbitals : int
-        Number of orbitals
-    num_wann : int
-        Number of Wannier functions
-    
-    Returns
-    -------
-    dict
-        Dictionary with memory estimates in MB
-    """
-    bytes_per_complex = 16  # complex128
-    
-    # H(k) and S(k) for all k-points
-    matrices_mb = 2 * num_kpoints * num_orbitals**2 * bytes_per_complex / 1e6
-    
-    # Eigenvalues for all k-points
-    eigenvalues_mb = num_kpoints * num_wann * 8 / 1e6
-    
-    # Eigenvectors for all k-points
-    eigenvectors_mb = num_kpoints * num_orbitals * num_wann * bytes_per_complex / 1e6
-    
-    total_mb = matrices_mb + eigenvalues_mb + eigenvectors_mb
-    
-    return {
-        'matrices': matrices_mb,
-        'eigenvalues': eigenvalues_mb,
-        'eigenvectors': eigenvectors_mb,
-        'total': total_mb
-    }
-
-
 def print_calculation_info(
     num_kpoints: int,
     k_grid: Tuple[int, int, int],
     num_orbitals: int,
     num_wann: int
 ) -> None:
-    """
-    Print information about the calculation.
-    
-    Parameters
-    ----------
-    num_kpoints : int
-        Number of k-points
-    k_grid : tuple of 3 ints
-        K-point grid dimensions
-    num_orbitals : int
-        Number of orbitals
-    num_wann : int
-        Number of Wannier functions
-    """
+    """Print information about the calculation parameters and memory."""
     print("\n" + "=" * 70)
     print("Calculation Information")
     print("=" * 70)
@@ -270,10 +268,15 @@ def print_calculation_info(
     print(f"Number of Wannier functions: {num_wann}")
     
     # Memory estimate
-    mem = estimate_memory_usage(num_kpoints, num_orbitals, num_wann)
+    bytes_per_complex = 16
+    matrices_mb = 2 * num_kpoints * num_orbitals**2 * bytes_per_complex / 1e6
+    eigenvalues_mb = num_kpoints * num_wann * 8 / 1e6
+    eigenvectors_mb = num_kpoints * num_orbitals * num_wann * bytes_per_complex / 1e6
+    total_mb = matrices_mb + eigenvalues_mb + eigenvectors_mb
+    
     print(f"\nEstimated memory usage:")
-    print(f"  Matrices (H, S): {mem['matrices']:.1f} MB")
-    print(f"  Eigenvalues: {mem['eigenvalues']:.1f} MB")
-    print(f"  Eigenvectors: {mem['eigenvectors']:.1f} MB")
-    print(f"  Total: {mem['total']:.1f} MB")
+    print(f"  Matrices (H, S): {matrices_mb:.1f} MB")
+    print(f"  Eigenvalues:     {eigenvalues_mb:.1f} MB")
+    print(f"  Eigenvectors:    {eigenvectors_mb:.1f} MB")
+    print(f"  Total:           {total_mb:.1f} MB")
     print("=" * 70)

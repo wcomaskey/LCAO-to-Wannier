@@ -2,14 +2,13 @@
 Parser Module for LCAO Output Files
 
 This module contains functions to parse overlap and Fock matrices from
-CRYSTAL/LCAO output files and create spin-block matrices.
-
-Based on original parsing code with enhancements for robustness.
+CRYSTAL/LCAO output files and create spin-block matrices using 
+Robust Global Pair-Symmetry Construction.
 """
 
 import numpy as np
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 # ==============================
 # Regular Expression Patterns
@@ -42,45 +41,53 @@ vector_line_pattern = re.compile(
 # ==============================
 
 def is_hermitian(matrix: np.ndarray, tol: float = 1e-34) -> bool:
-    """
-    Check if a matrix is Hermitian.
-    
-    Parameters
-    ----------
-    matrix : ndarray
-        Complex matrix to check
-    tol : float
-        Tolerance for comparison
-    
-    Returns
-    -------
-    bool
-        True if matrix is Hermitian within tolerance
-    """
+    """Check if a matrix is Hermitian."""
     return np.allclose(matrix, matrix.conj().T, atol=tol)
 
 
-def make_hermitian(matrix: np.ndarray) -> np.ndarray:
+def fill_raw_matrix(
+    H_R_dict: Dict, 
+    S_R_dict: Dict, 
+    R: Tuple[int, int, int], 
+    N_basis: int, 
+    is_fock: bool = True
+) -> np.ndarray:
     """
-    Adjust a matrix to be Hermitian by averaging with its conjugate transpose.
-    
-    Parameters
-    ----------
-    matrix : ndarray
-        Input matrix
-    
-    Returns
-    -------
-    ndarray
-        Hermitianized matrix
+    Constructs a 2N x 2N matrix containing ONLY the raw lower-triangular 
+    data found in the file for a specific R vector.
     """
-    if is_hermitian(matrix):
-        return matrix
+    if is_fock:
+        M_raw = np.zeros((2 * N_basis, 2 * N_basis), dtype=np.complex128)
+        data_source = H_R_dict
+    else:
+        M_raw = np.zeros((2 * N_basis, 2 * N_basis), dtype=np.float64)
+        data_source = S_R_dict
+
+    def insert_block(spin_key, row_offset, col_offset):
+        if is_fock:
+            if R in data_source and spin_key in data_source[R]:
+                block = data_source[R][spin_key]
+                # Enforce lower triangular reading
+                M_raw[row_offset:row_offset+N_basis, col_offset:col_offset+N_basis] = np.tril(block)
+        else:
+            if R in data_source:
+                block = data_source[R]
+                L = np.tril(block)
+                # Apply to Top-Left (AA)
+                M_raw[0:N_basis, 0:N_basis] = L
+                # Apply to Bottom-Right (BB)
+                M_raw[N_basis:2*N_basis, N_basis:2*N_basis] = L
     
-    # Use lower triangle and its conjugate transpose
-    hermitian_matrix = np.tril(matrix)
-    hermitian_matrix += np.tril(matrix, -1).conj().T
-    return hermitian_matrix
+    if is_fock:
+        insert_block('ALPHA_ALPHA', 0, 0)
+        insert_block('BETA_BETA', N_basis, N_basis)
+        insert_block('ALPHA_BETA', 0, N_basis) 
+        insert_block('BETA_ALPHA', N_basis, 0) 
+    else:
+        # Overlap handling (assumed symmetric for AA and BB)
+        insert_block(None, 0, 0)
+
+    return M_raw
 
 
 # ==============================
@@ -88,23 +95,7 @@ def make_hermitian(matrix: np.ndarray) -> np.ndarray:
 # ==============================
 
 def parse_matrix_data(lines: List[str], start_index: int) -> Dict:
-    """
-    Parse matrix data from file lines starting at a given index.
-    
-    Parameters
-    ----------
-    lines : list of str
-        Lines from the output file
-    start_index : int
-        Index to start parsing from
-    
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - 'matrix': numpy array of the parsed matrix
-        - 'next_index': index where parsing stopped
-    """
+    """Parse matrix data from file lines starting at a given index."""
     data_lines = []
     i = start_index
     col_indices = []
@@ -113,7 +104,6 @@ def parse_matrix_data(lines: List[str], start_index: int) -> Dict:
         line = lines[i].rstrip('\n')
         line_stripped = line.strip()
         
-        # End parsing if we hit a new section header
         if (overlap_header_pattern.match(line) or
             fock_header_pattern.match(line) or
             spin_channel_pattern.match(line) or
@@ -154,22 +144,8 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
     """
     Parse overlap and Fock matrices from CRYSTAL/LCAO output file lines.
     
-    Parameters
-    ----------
-    lines : list of str
-        Lines from the output file
-    
-    Returns
-    -------
-    matrices : list of dict
-        List of matrix dictionaries containing:
-        - 'type': 'overlap' or 'fock'
-        - 'part': 'real', 'imag', or 'complex'
-        - 'spin_channel': spin channel identifier (for Fock matrices)
-        - 'lattice_vector': tuple of (R1, R2, R3)
-        - 'data': numpy array of matrix data
-    direct_lattice_vectors : list of lists or None
-        3x3 list of lattice vectors in Angstroms
+    NOTE: This version returns RAW complex matrices. It does NOT enforce 
+    Hermiticity at this stage, as that is handled during global construction.
     """
     matrices = []
     direct_lattice_vectors = None
@@ -196,13 +172,9 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
                         for val in float_pattern.findall(vector_line)
                     ]
                     vectors.append(components)
-                else:
-                    print(f"Warning: Line does not match vector format: '{vector_line}'")
                 i += 1
             if len(vectors) == 3:
                 direct_lattice_vectors = vectors
-            else:
-                print("Warning: Incomplete direct lattice vectors found.")
         
         # Parse spin channel header
         elif spin_channel_pattern.match(line):
@@ -215,13 +187,12 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
             header_match = overlap_header_pattern.match(line)
             lattice_vector = [int(header_match.group(j)) for j in range(1, 4)]
             matrix_type = 'overlap'
-            part = 'real'
             i += 1
             S_parsed = parse_matrix_data(lines, i)
             matrices.append({
                 'type': matrix_type,
-                'part': part,
-                'spin_channel': None,  # Overlap matrices are spin-independent
+                'part': 'real',
+                'spin_channel': None,
                 'lattice_vector': lattice_vector,
                 'data': S_parsed['matrix'],
             })
@@ -230,7 +201,7 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
         # Parse Fock matrix
         elif fock_header_pattern.match(line):
             header_match = fock_header_pattern.match(line)
-            part = header_match.group(1).lower()  # 'real' or 'imag'
+            part = header_match.group(1).lower()
             lattice_vector = tuple(int(header_match.group(j)) for j in range(2, 5))
             matrix_type = 'fock'
             i += 1
@@ -258,26 +229,15 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
         else:
             continue
         
-        # Apply Hermitianization for diagonal spin blocks
-        if spin_channel in ['ALPHA_ALPHA', 'BETA_BETA']:
-            hermitian_matrix = make_hermitian(complex_matrix)
-            matrices.append({
-                'type': 'fock',
-                'part': 'complex',
-                'spin_channel': spin_channel,
-                'lattice_vector': lattice_vector,
-                'data': hermitian_matrix,
-            })
-        elif spin_channel in ['ALPHA_BETA', 'BETA_ALPHA']:
-            matrices.append({
-                'type': 'fock',
-                'part': 'complex',
-                'spin_channel': spin_channel,
-                'lattice_vector': lattice_vector,
-                'data': complex_matrix,
-            })
-        else:
-            print(f"Warning: Unknown spin channel '{spin_channel}' encountered.")
+        # We append the complex matrix AS IS.
+        # Hermiticity is enforced later in create_spin_block_matrices.
+        matrices.append({
+            'type': 'fock',
+            'part': 'complex',
+            'spin_channel': spin_channel,
+            'lattice_vector': lattice_vector,
+            'data': complex_matrix,
+        })
     
     return matrices, direct_lattice_vectors
 
@@ -296,96 +256,108 @@ def create_spin_block_matrices(
     """
     Construct full 2N x 2N spin block Hamiltonian and overlap matrices.
     
-    Parameters
-    ----------
-    H_R_dict : dict
-        Maps (R1, R2, R3) to dict of spin channel matrices
-    S_R_dict : dict
-        Maps (R1, R2, R3) to overlap matrix
-    N_basis : int
-        Number of basis functions per spin channel
-    direct_lattice_vectors : list of lists
-        3x3 lattice vectors in Cartesian coordinates
-    PRINTOUT : bool
-        Whether to print warnings
+    This function uses Global Pair Symmetry Construction:
+    1. It identifies pairs of vectors (R, -R).
+    2. It combines the raw lower-triangular data of R with the raw lower-triangular
+       data of -R to strictly enforce the relationship H(R) = H(-R)†.
+    3. It handles the origin H(0) by ensuring exact Hermiticity and real diagonal.
     
     Returns
     -------
-    H_full_list : list of tuples
-        List of (R_cartesian, H_full_matrix) tuples
-    S_full_list : list of tuples
-        List of (R_cartesian, S_full_matrix) tuples
+    H_full_list : list of tuples (R_cartesian, H_matrix)
+    S_full_list : list of tuples (R_cartesian, S_matrix)
     """
     H_full_list = []
     S_full_list = []
     direct_lattice_vectors = np.array(direct_lattice_vectors)
     
-    # Process Hamiltonian matrices
-    for R in H_R_dict:
-        R_integer = np.array(R)
-        R_cartesian = np.matmul(R_integer, direct_lattice_vectors)
-        H_full = np.zeros((2 * N_basis, 2 * N_basis), dtype=np.complex128)
-        H_channels = H_R_dict.get(R, {})
-        
-        # Alpha-alpha block
-        if 'ALPHA_ALPHA' in H_channels:
-            H_aa = H_channels['ALPHA_ALPHA']
-            if not is_hermitian(H_aa):
-                if PRINTOUT:
-                    print(f"Warning: H_{R}_ALPHA_ALPHA is not Hermitian. Adjusting it.")
-                H_aa = make_hermitian(H_aa)
-            H_full[0:N_basis, 0:N_basis] = H_aa
-        else:
-            raise ValueError(f"Error: H_{R}_ALPHA_ALPHA is missing.")
-        
-        # Beta-beta block
-        if 'BETA_BETA' in H_channels:
-            H_bb = H_channels['BETA_BETA']
-            if not is_hermitian(H_bb):
-                if PRINTOUT:
-                    print(f"Warning: H_{R}_BETA_BETA is not Hermitian. Adjusting it.")
-                H_bb = make_hermitian(H_bb)
-            H_full[N_basis:2 * N_basis, N_basis:2 * N_basis] = H_bb
-        else:
-            raise ValueError(f"Error: H_{R}_BETA_BETA is missing.")
-        
-        # Off-diagonal spin blocks
-        F_alpha_beta = H_channels.get('ALPHA_BETA')
-        F_beta_alpha = H_channels.get('BETA_ALPHA')
-        
-        if F_alpha_beta is None or F_beta_alpha is None:
-            raise ValueError(
-                f"Error: For R = {R}, both F_alpha_beta and F_beta_alpha must be provided."
-            )
-        
-        F_alpha_beta_dag = F_alpha_beta.conj().T
-        F_alpha_beta_dag_no_diag = F_alpha_beta_dag - np.diag(np.diag(F_alpha_beta_dag))
-        F_beta_alpha_adjusted = F_beta_alpha + F_alpha_beta_dag_no_diag
-        
-        H_full[0:N_basis, N_basis:2 * N_basis] = F_beta_alpha_adjusted.conj().T
-        H_full[N_basis:2 * N_basis, 0:N_basis] = F_beta_alpha_adjusted
-        
-        if not is_hermitian(H_full):
-            if PRINTOUT:
-                print(f"Warning: Full Hamiltonian for R = {R} is not Hermitian. Adjusting it.")
-            H_full = make_hermitian(H_full)
-        
-        H_full_list.append((R_cartesian, H_full))
+    all_R_vectors = set(H_R_dict.keys())
     
-    # Process overlap matrices (assumed spin-independent)
-    for R in S_R_dict:
-        R_integer = np.array(R)
-        R_cartesian = np.matmul(R_integer, direct_lattice_vectors)
-        S_full = np.zeros((2 * N_basis, 2 * N_basis), dtype=np.float64)
-        S = S_R_dict[R]
-        
-        if not np.allclose(S, S.T, atol=1e-34):
-            if PRINTOUT:
-                print(f"Warning: Overlap matrix for R = {R} is not symmetric. Adjusting it.")
-            S = (S + S.T) - np.diag(np.diag(S))
-        
-        S_full[0:N_basis, 0:N_basis] = S
-        S_full[N_basis:2 * N_basis, N_basis:2 * N_basis] = S
-        S_full_list.append((R_cartesian, S_full))
+    # Identify valid pairs (ensure we only process (R, -R) once)
+    processed_R = set()
+    valid_pairs = [] 
     
+    # Sort for consistent output/processing order
+    sorted_R = sorted(list(all_R_vectors))
+    
+    for R in sorted_R:
+        if R in processed_R: continue
+        
+        minus_R = tuple(-x for x in R)
+        
+        if R == (0, 0, 0):
+            valid_pairs.append((R, R))
+            processed_R.add(R)
+        elif minus_R in all_R_vectors:
+            valid_pairs.append((R, minus_R))
+            processed_R.add(R)
+            processed_R.add(minus_R)
+        else:
+            if PRINTOUT:
+                print(f"Warning: Vector {R} exists but {minus_R} is missing. Excluding.")
+
+    # Iterate over pairs and construct matrices
+    for R, minus_R in valid_pairs:
+        is_origin = (R == minus_R)
+        
+        # Calculate Cartesian vectors
+        R_cart = np.dot(np.array(R), direct_lattice_vectors)
+        minus_R_cart = np.dot(np.array(minus_R), direct_lattice_vectors)
+        
+        # ============================================================
+        # 1. FOCK CONSTRUCTION
+        # ============================================================
+        
+        # Build Raw Lower Data (Global 2N x 2N container)
+        M_raw_R = fill_raw_matrix(H_R_dict, S_R_dict, R, N_basis, is_fock=True)
+        M_raw_minus_R = fill_raw_matrix(H_R_dict, S_R_dict, minus_R, N_basis, is_fock=True)
+        
+        # Prepare the Upper part from the -R partner
+        # We take the STRICT lower triangle of -R (remove diagonal)
+        # Its Conjugate Transpose becomes the Strict Upper Triangle of R
+        M_minus_R_nodiag = M_raw_minus_R.copy()
+        rows, cols = np.diag_indices_from(M_minus_R_nodiag)
+        M_minus_R_nodiag[rows, cols] = 0 
+        
+        # Combine: H(R) = Lower(R) + [Lower_Strict(-R)]†
+        H_R_full = M_raw_R + M_minus_R_nodiag.conj().T
+        
+        # Enforce Origin Hermiticity (Physical Requirement)
+        if is_origin:
+            diags = np.diag(H_R_full)
+            np.fill_diagonal(H_R_full, np.real(diags))
+        
+        # Add H(R) to list
+        H_full_list.append((R_cart, H_R_full))
+        
+        # Derive and Add H(-R)
+        if not is_origin:
+            # Enforce exact symmetry: H(-R) = H(R)†
+            H_minus_R_full = H_R_full.conj().T
+            H_full_list.append((minus_R_cart, H_minus_R_full))
+        
+        # ============================================================
+        # 2. OVERLAP CONSTRUCTION
+        # ============================================================
+        if R in S_R_dict and (is_origin or minus_R in S_R_dict):
+            # Note: For origin, S_raw_R and S_raw_minus_R are the same
+            S_raw_R = fill_raw_matrix(H_R_dict, S_R_dict, R, N_basis, is_fock=False)
+            S_raw_minus_R = fill_raw_matrix(H_R_dict, S_R_dict, minus_R, N_basis, is_fock=False)
+            
+            # Prepare Upper part from -R partner
+            S_minus_R_nodiag = S_raw_minus_R.copy()
+            rows, cols = np.diag_indices_from(S_minus_R_nodiag)
+            S_minus_R_nodiag[rows, cols] = 0
+            
+            # Combine: S(R) = Lower(R) + [Lower_Strict(-R)]^T 
+            # (Transpose only, because Overlap is Real)
+            S_R_full = S_raw_R + S_minus_R_nodiag.T
+            
+            S_full_list.append((R_cart, S_R_full))
+
+            if not is_origin:
+                # Enforce exact symmetry: S(-R) = S(R)^T
+                S_minus_R_full = S_R_full.T
+                S_full_list.append((minus_R_cart, S_minus_R_full))
+
     return H_full_list, S_full_list
