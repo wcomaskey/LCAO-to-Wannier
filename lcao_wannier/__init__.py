@@ -22,42 +22,9 @@ prepare_real_space_matrices : function
     Convert parsed matrices to engine-compatible format
 organize_matrices_by_lattice_vector : function
     Organize raw matrices by lattice vector and spin channel
-
-Example
--------
->>> from lcao_wannier import Wannier90Engine, parse_overlap_and_fock_matrices
->>> from lcao_wannier import create_spin_block_matrices, prepare_real_space_matrices
->>> from lcao_wannier.utils import organize_matrices_by_lattice_vector
->>>
->>> # Parse CRYSTAL output
->>> with open('crystal.out', 'r') as f:
->>>     lines = f.readlines()
->>> matrices, lattice_vectors = parse_overlap_and_fock_matrices(lines)
->>>
->>> # Organize and create spin blocks
->>> H_R_dict, S_R_dict = organize_matrices_by_lattice_vector(matrices)
->>> N_basis = next(iter(S_R_dict.values())).shape[0]
->>> H_full_list, S_full_list = create_spin_block_matrices(
-...     H_R_dict, S_R_dict, N_basis, lattice_vectors
-... )
->>>
->>> # Prepare for engine
->>> real_space_matrices = prepare_real_space_matrices(
-...     H_full_list, S_full_list, np.array(lattice_vectors)
-... )
->>>
->>> # Run engine
->>> engine = Wannier90Engine(
-...     real_space_matrices=real_space_matrices,
-...     k_grid=(8, 8, 8),
-...     lattice_vectors=np.array(lattice_vectors),
-...     num_wann=20,
-...     seedname='material'
-... )
->>> engine.run(parallel=True, verify=True)
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __author__ = "William Comaskey"
 
 # Main engine class
@@ -121,6 +88,19 @@ from .wannier90 import (
     write_amn_file,
     write_mmn_file,
     write_wannier90_files,
+)
+
+from .band_selection import (
+    estimate_fermi_energy,
+    analyze_band_window,
+    print_band_analysis,
+    check_frozen_continuity,
+    validate_fermi_coverage,
+    select_projection_orbitals,
+    compute_subspace_projections,
+    suggest_optimal_window,
+    BandWindowResult,
+    OrbitalSelectionResult
 )
 
 # Public API
