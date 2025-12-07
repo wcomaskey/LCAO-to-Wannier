@@ -33,9 +33,11 @@ from .engine import Wannier90Engine
 # Parser functions
 from .parser import (
     parse_overlap_and_fock_matrices,
+    parse_calculation_parameters,  # NEW
     create_spin_block_matrices,
     fill_raw_matrix,
     is_hermitian,
+    CalculationParameters,  # NEW
 )
 
 # Utility functions
@@ -113,6 +115,8 @@ __all__ = [
     'create_spin_block_matrices',
     'fill_raw_matrix',
     'is_hermitian',
+    'parse_calculation_parameters',
+    'CalculationParameters',
     
     # Utils
     'prepare_real_space_matrices',

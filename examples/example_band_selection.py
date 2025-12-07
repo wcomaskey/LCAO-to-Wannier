@@ -19,6 +19,7 @@ import numpy as np
 from lcao_wannier import (
     Wannier90Engine,
     parse_overlap_and_fock_matrices,
+    parse_calculation_parameters,
     create_spin_block_matrices,
     prepare_real_space_matrices,
     estimate_fermi_energy,
@@ -100,6 +101,33 @@ def main():
     with open(args.lcao_file, 'r') as f:
         lines = f.readlines()
     print(f"  Read {len(lines)} lines from file")
+    
+    # Parse calculation parameters (Fermi energy, electron count, k-grid, etc.)
+    params = parse_calculation_parameters(lines)
+    
+    if params.fermi_energy is not None:
+        print(f"  Fermi energy from file: {params.fermi_energy:.4f} eV")
+    if params.num_electrons is not None:
+        print(f"  Number of electrons from file: {params.num_electrons}")
+    if params.k_grid is not None:
+        print(f"  K-grid from file: {params.k_grid[0]} × {params.k_grid[1]} × {params.k_grid[2]}")
+    if params.num_ao is not None:
+        print(f"  Number of AO from file: {params.num_ao}")
+    
+    # Use file values as defaults if not specified by user
+    if args.e_fermi is None and params.fermi_energy is not None:
+        args.e_fermi = params.fermi_energy
+        print(f"  → Using Fermi energy from file: {args.e_fermi:.4f} eV")
+    
+    if args.num_electrons is None and params.num_electrons is not None:
+        args.num_electrons = params.num_electrons
+        print(f"  → Using electron count from file: {args.num_electrons}")
+    
+    # Check if user provided default k-grid [8, 8, 1] - if so, prefer file value
+    default_k_grid = [8, 8, 1]
+    if args.k_grid == default_k_grid and params.k_grid is not None:
+        args.k_grid = list(params.k_grid)
+        print(f"  → Using k-grid from file: {args.k_grid[0]} × {args.k_grid[1]} × {args.k_grid[2]}")
     
     # Parse matrices and lattice vectors
     matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)

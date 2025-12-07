@@ -9,6 +9,7 @@ Robust Global Pair-Symmetry Construction.
 import numpy as np
 import re
 from typing import List, Dict, Tuple, Optional, Any
+from dataclasses import dataclass
 
 # ==============================
 # Regular Expression Patterns
@@ -34,6 +35,130 @@ direct_lattice_header_pattern = re.compile(
 vector_line_pattern = re.compile(
     r'^\s*' + r'\s+'.join([float_pattern.pattern] * 3) + r'\s*$'
 )
+
+
+# ==============================
+# Calculation Parameters Dataclass
+# ==============================
+
+@dataclass
+class CalculationParameters:
+    """
+    Parameters parsed from CRYSTAL/LCAO output file header.
+    
+    Attributes
+    ----------
+    fermi_energy : float or None
+        Fermi energy in eV (converted from Hartree)
+    fermi_energy_hartree : float or None
+        Fermi energy in Hartree (raw value from file)
+    num_electrons : int or None
+        Number of electrons per cell
+    k_grid : tuple of 3 ints or None
+        Monkhorst-Pack k-point grid dimensions
+    num_atoms : int or None
+        Number of atoms per cell
+    num_shells : int or None
+        Number of shells
+    num_ao : int or None
+        Number of atomic orbitals
+    total_energy : float or None
+        Total energy in Hartree
+    """
+    fermi_energy: Optional[float] = None
+    fermi_energy_hartree: Optional[float] = None
+    num_electrons: Optional[int] = None
+    k_grid: Optional[Tuple[int, int, int]] = None
+    num_atoms: Optional[int] = None
+    num_shells: Optional[int] = None
+    num_ao: Optional[int] = None
+    total_energy: Optional[float] = None
+
+
+def parse_calculation_parameters(lines: List[str]) -> CalculationParameters:
+    """
+    Parse calculation parameters from CRYSTAL/LCAO output file.
+    
+    Extracts key parameters from the file header including Fermi energy,
+    electron count, k-grid, and other useful information.
+    
+    Parameters
+    ----------
+    lines : list of str
+        Lines from the CRYSTAL output file
+        
+    Returns
+    -------
+    CalculationParameters
+        Dataclass containing parsed parameters
+        
+    Examples
+    --------
+    >>> with open('crystal.out', 'r') as f:
+    ...     lines = f.readlines()
+    >>> params = parse_calculation_parameters(lines)
+    >>> print(f"Fermi energy: {params.fermi_energy} eV")
+    >>> print(f"K-grid: {params.k_grid}")
+    """
+    params = CalculationParameters()
+    
+    # Conversion factor
+    HARTREE_TO_EV = 27.2114
+    
+    for line in lines:
+        # Parse FERMI ENERGY (in Hartree)
+        # Format: FERMI ENERGY              -0.137E+00
+        if 'FERMI ENERGY' in line and params.fermi_energy is None:
+            match = re.search(r'FERMI ENERGY\s+([-+]?\d*\.?\d+[EeDd]?[+-]?\d*)', line)
+            if match:
+                fermi_str = match.group(1).replace('D', 'E').replace('d', 'e')
+                params.fermi_energy_hartree = float(fermi_str)
+                params.fermi_energy = params.fermi_energy_hartree * HARTREE_TO_EV
+        
+        # Parse N. OF ELECTRONS PER CELL
+        # Format: N. OF ELECTRONS PER CELL    46
+        if 'N. OF ELECTRONS PER CELL' in line and params.num_electrons is None:
+            match = re.search(r'N\. OF ELECTRONS PER CELL\s+(\d+)', line)
+            if match:
+                params.num_electrons = int(match.group(1))
+        
+        # Parse SHRINK. FACT.(MONKH.) k-grid
+        # Format: SHRINK. FACT.(MONKH.)    15 15  1  SHRINKING FACTOR(GILAT NET)       15
+        if 'SHRINK. FACT.(MONKH.)' in line and params.k_grid is None:
+            match = re.search(r'SHRINK\. FACT\.\(MONKH\.\)\s+(\d+)\s+(\d+)\s+(\d+)', line)
+            if match:
+                params.k_grid = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        
+        # Parse N. OF ATOMS PER CELL
+        # Format: N. OF ATOMS PER CELL         2
+        if 'N. OF ATOMS PER CELL' in line and params.num_atoms is None:
+            match = re.search(r'N\. OF ATOMS PER CELL\s+(\d+)', line)
+            if match:
+                params.num_atoms = int(match.group(1))
+        
+        # Parse NUMBER OF SHELLS
+        # Format: NUMBER OF SHELLS            20
+        if 'NUMBER OF SHELLS' in line and params.num_shells is None:
+            match = re.search(r'NUMBER OF SHELLS\s+(\d+)', line)
+            if match:
+                params.num_shells = int(match.group(1))
+        
+        # Parse NUMBER OF AO
+        # Format: NUMBER OF AO                56
+        if 'NUMBER OF AO' in line and params.num_ao is None:
+            match = re.search(r'NUMBER OF AO\s+(\d+)', line)
+            if match:
+                params.num_ao = int(match.group(1))
+        
+        # Parse TOTAL ENERGY
+        # Format: TOTAL ENERGY -4.2943592973046E+02
+        if 'TOTAL ENERGY' in line and params.total_energy is None:
+            match = re.search(r'TOTAL ENERGY\s+([-+]?\d*\.?\d+[EeDd]?[+-]?\d*)', line)
+            if match:
+                energy_str = match.group(1).replace('D', 'E').replace('d', 'e')
+                params.total_energy = float(energy_str)
+    
+    return params
 
 
 # ==============================

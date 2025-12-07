@@ -228,7 +228,8 @@ class Wannier90Engine:
     def solve_all_kpoints(
         self,
         parallel: bool = True,
-        num_processes: Optional[int] = None
+        num_processes: Optional[int] = None,
+        convert_to_eV: bool = True
     ) -> None:
         """
         Solve the generalized eigenvalue problem for all k-points.
@@ -243,6 +244,9 @@ class Wannier90Engine:
         num_processes : int, optional
             Number of processes for parallel computation
             If None, uses all available CPUs
+        convert_to_eV : bool, optional
+            Convert eigenvalues from Hartree to eV (default: True)
+            Set to False if your Fock matrix is already in eV
         """
         print(f"\n{'=' * 70}")
         print(f"Solving Eigenvalue Problems at {self.num_kpoints} K-Points")
@@ -271,6 +275,12 @@ class Wannier90Engine:
         
         # Unpack results
         self.eigenvalues_list, self.eigenvectors_list, self.H_k_list, self.S_k_list = results
+        
+        # Convert eigenvalues from Hartree to eV
+        if convert_to_eV:
+            HARTREE_TO_EV = 27.2114
+            self.eigenvalues_list = [eigs * HARTREE_TO_EV for eigs in self.eigenvalues_list]
+            print(f"✓ Eigenvalues converted from Hartree to eV")
         
         print(f"✓ Eigenvalue problems solved successfully")
         print(f"{'=' * 70}")
