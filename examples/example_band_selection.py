@@ -260,39 +260,79 @@ def main():
         )
         print(f"\nEstimated Fermi energy: {e_fermi:.4f} eV")
         
-        # Get energy statistics
-        stats = engine.get_energy_statistics()
-        print(f"\nBand structure statistics:")
-        print(f"  Energy range: [{stats['e_min']:.2f}, {stats['e_max']:.2f}] eV")
-        print(f"  Total bandwidth: {stats['bandwidth']:.2f} eV")
-        if stats['gap'] is not None:
-            print(f"  Band gap: {stats['gap']:.2f} eV")
+        # Use file E_F if available, otherwise use estimated
+        if args.e_fermi is not None:
+            e_fermi_display = args.e_fermi
+            print(f"Using Fermi energy from file: {e_fermi_display:.4f} eV")
+        else:
+            e_fermi_display = e_fermi
+        
+        # Get energy statistics for physically relevant bands (near E_F)
+        all_eigs = np.array(engine.eigenvalues_list)
+        
+        # Find bands within reasonable range of E_F (exclude vacuum states)
+        # Consider bands within 50 eV of E_F as "physical"
+        band_mins = np.min(all_eigs, axis=0)
+        band_maxs = np.max(all_eigs, axis=0)
+        physical_mask = (band_maxs > e_fermi_display - 50) & (band_mins < e_fermi_display + 50)
+        physical_bands = np.where(physical_mask)[0]
+        
+        if len(physical_bands) > 0:
+            phys_eigs = all_eigs[:, physical_bands]
+            e_min_phys = np.min(phys_eigs)
+            e_max_phys = np.max(phys_eigs)
+            
+            print(f"\nBand structure statistics (bands near E_F):")
+            print(f"  Physical bands: {physical_bands[0]}-{physical_bands[-1]} ({len(physical_bands)} bands)")
+            print(f"  Energy range: [{e_min_phys:.2f}, {e_max_phys:.2f}] eV")
+            print(f"  Bandwidth: {e_max_phys - e_min_phys:.2f} eV")
+            
+            # Find gap near E_F
+            occupied = band_maxs[band_maxs < e_fermi_display]
+            unoccupied = band_mins[band_mins > e_fermi_display]
+            if len(occupied) > 0 and len(unoccupied) > 0:
+                vbm = np.max(occupied)
+                cbm = np.min(unoccupied)
+                gap = cbm - vbm
+                if gap > 0 and gap < 20:  # Reasonable gap
+                    print(f"  Band gap: {gap:.2f} eV (VBM={vbm:.2f}, CBM={cbm:.2f})")
+                else:
+                    print(f"  Band gap: metallic or semi-metallic")
+            
+            # Also show full range for reference
+            print(f"\nFull eigenvalue range (including vacuum states):")
+            print(f"  [{np.min(all_eigs):.2f}, {np.max(all_eigs):.2f}] eV")
         
         # Suggest window
         suggested = suggest_optimal_window(
             engine.eigenvalues_list,
-            e_fermi=e_fermi,
+            e_fermi=e_fermi_display,
             target_num_wann=args.target_wann
         )
         
+        # Convert suggested (absolute) to relative for display
+        suggested_relative = (suggested[0] - e_fermi_display, suggested[1] - e_fermi_display)
+        
         # Test the suggested window
         print("\nTesting suggested window...")
+        print(f"  Absolute: [{suggested[0]:.2f}, {suggested[1]:.2f}] eV")
+        print(f"  Relative to E_F: [{suggested_relative[0]:.2f}, {suggested_relative[1]:.2f}] eV")
+        
         analysis = analyze_band_window(
             engine.eigenvalues_list,
             outer_window=suggested,
-            e_fermi=0.0,
-            window_is_relative=False
+            e_fermi=e_fermi_display,
+            window_is_relative=False  # suggested is in absolute coordinates
         )
         print_band_analysis(analysis)
         
         print("\n" + "=" * 70)
         print("SUGGESTION COMPLETE")
         print("=" * 70)
-        print(f"\nTo run with this window, use:")
+        print(f"\nTo run with this window (relative to E_F), use:")
         print(f"  python {sys.argv[0]} {args.lcao_file} \\")
         print(f"    --k-grid {k_grid[0]} {k_grid[1]} {k_grid[2]} \\")
-        print(f"    --window {suggested[0] - e_fermi:.2f} {suggested[1] - e_fermi:.2f} \\")
-        print(f"    --e-fermi {e_fermi:.4f}")
+        print(f"    --window {suggested_relative[0]:.2f} {suggested_relative[1]:.2f}")
         
     elif args.window is not None:
         # Mode 2: Run with specified window

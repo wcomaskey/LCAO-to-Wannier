@@ -516,12 +516,24 @@ class Wannier90Engine:
         print("Verification Checks")
         print(f"{'=' * 70}")
         
+        # If band selection is active, extract only selected bands for verification
+        if self.selected_band_indices is not None:
+            band_indices = self.selected_band_indices
+            eigenvalues_to_verify = [eigs[band_indices] for eigs in self.eigenvalues_list]
+            eigenvectors_to_verify = [vecs[:, band_indices] for vecs in self.eigenvectors_list]
+            num_bands_to_verify = len(band_indices)
+            print(f"Verifying {num_bands_to_verify} selected bands (indices {band_indices[0]}-{band_indices[-1]})")
+        else:
+            eigenvalues_to_verify = self.eigenvalues_list
+            eigenvectors_to_verify = self.eigenvectors_list
+            num_bands_to_verify = self.num_wann
+        
         results = run_all_verifications(
-            self.eigenvalues_list,
-            self.eigenvectors_list,
+            eigenvalues_to_verify,
+            eigenvectors_to_verify,
             self.H_k_list,
             self.S_k_list,
-            self.num_wann,
+            num_bands_to_verify,
             verbose=True
         )
         
