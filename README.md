@@ -1,6 +1,6 @@
 # LCAO to Wannier90 Conversion Package
 
-Version 1.0.0
+Version 1.0.2
 
 ## Overview
 
@@ -54,6 +54,7 @@ results = engine.run(parallel=True, verify=True)
 lcao_wannier/
 ├── lcao_wannier/          Main package
 │   ├── __init__.py        Package exports
+|   ├── band_selection.py  Band Selection Tools
 │   ├── parser.py          LCAO output parsing
 │   ├── kpoints.py         K-point grid generation
 │   ├── fourier.py         Fourier transforms
