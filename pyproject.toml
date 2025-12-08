@@ -43,10 +43,10 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/lcao-wannier"
+Homepage = "https://github.com/wcomaskey/lcao-wannier"
 Documentation = "https://lcao-wannier.readthedocs.io"
-Repository = "https://github.com/yourusername/lcao-wannier"
-"Bug Tracker" = "https://github.com/yourusername/lcao-wannier/issues"
+Repository = "https://github.com/wcomaskey/lcao-wannier"
+"Bug Tracker" = "https://github.com/wcomaskey/lcao-wannier/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
