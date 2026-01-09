@@ -154,6 +154,47 @@ def read_nnkp_neighbors(nnkp_file: str, recip_lattice: Optional[np.ndarray] = No
     return neighbor_list
 
 
+def convert_neighbor_list_to_dict_format(
+    neighbor_list_old: Dict[int, List[Tuple[int, np.ndarray]]],
+    recip_lattice: np.ndarray
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Convert old neighbor list format to new dict format.
+
+    Old format: {k_idx: [(k_next_idx, G_shift), ...]}
+    New format: {k_idx: [{'id': k_next_idx, 'G_shift': G, 'b_vec_cart': b}, ...]}
+
+    Parameters
+    ----------
+    neighbor_list_old : dict
+        Old format neighbor list
+    recip_lattice : ndarray
+        3x3 reciprocal lattice matrix (rows are reciprocal vectors)
+
+    Returns
+    -------
+    neighbor_list_new : dict
+        New format with Cartesian b-vectors
+    """
+    neighbor_list_new = {}
+
+    for k_idx, neighbors in neighbor_list_old.items():
+        neighbor_list_new[k_idx] = []
+
+        for k_next_idx, G_shift in neighbors:
+            # Convert G_shift to Cartesian b-vector
+            b_vec_cart = recip_lattice @ G_shift
+
+            neighbor_dict = {
+                'id': k_next_idx,
+                'G_shift': G_shift,
+                'b_vec_cart': b_vec_cart
+            }
+            neighbor_list_new[k_idx].append(neighbor_dict)
+
+    return neighbor_list_new
+
+
 def generate_neighbor_list(
     k_grid: Tuple[int, int, int]
 ) -> Dict[int, List[Tuple[int, np.ndarray]]]:

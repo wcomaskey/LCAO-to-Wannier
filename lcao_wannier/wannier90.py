@@ -87,10 +87,14 @@ def write_amn_file_lcao(
     num_wann : int
         Number of Wannier functions
     """
+    num_bands = len(band_indices)  # Number of bands to use
+    num_proj = len(orbital_indices)  # Number of projections
+
     with open(filename, 'w') as f:
         # Write header
+        # Wannier90 format: num_bands num_kpoints num_wann
         f.write("Created by LCAO-to-Wannier90 (Overlap-Corrected)\n")
-        f.write(f"{num_wann:5d} {num_kpoints:5d} {num_wann:5d}\n")
+        f.write(f"{num_bands:5d} {num_kpoints:5d} {num_proj:5d}\n")
 
         # Write projection matrices
         for k_idx in range(num_kpoints):
@@ -102,12 +106,12 @@ def write_amn_file_lcao(
             P_k = S_k @ C_k  # Shape: (num_orbitals, num_bands_all)
 
             # Extract selected orbitals (rows) and selected bands (columns)
-            A_k = P_k[np.ix_(orbital_indices, band_indices)]  # Shape: (num_wann, num_wann)
+            A_k = P_k[np.ix_(orbital_indices, band_indices)]  # Shape: (num_proj, num_bands)
 
             # Write elements: loop over bands m, then projectors n
             # Wannier90 format: band_idx  wannier_idx  kpoint_idx  Re(A)  Im(A)
-            for m in range(num_wann):
-                for n in range(num_wann):
+            for m in range(num_bands):
+                for n in range(num_proj):
                     # Wannier90 uses 1-based indexing
                     f.write(
                         f"{m + 1:5d} {n + 1:5d} {k_idx + 1:5d} "

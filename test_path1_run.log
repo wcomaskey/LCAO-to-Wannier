@@ -1,0 +1,128 @@
+[0;34m========================================[0m
+[0;34mPath 1: 12 WFs + Disentanglement[0m
+[0;34m========================================[0m
+Generating files with automatic Bi:p projections...
+================================================================================
+LCAO-to-Wannier90 Test: Bismuth with SOC (basis=40)
+================================================================================
+Input file: /Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/Bismuth_basis_40.out
+Mode: window
+
+Step 1: Parsing CRYSTAL output file...
+--------------------------------------------------------------------------------
+✓ Parsed calculation parameters:
+  Fermi energy: -3.727962 eV
+  Electrons: 46
+  K-grid from file: (15, 15, 1)
+  Number of AOs: 56
+  Number of atoms: 2
+  Total energy: -429.435930 Hartree
+✓ Parsed matrices:
+  Lattice vectors shape: (3, 3)
+  Number of matrix blocks: 200
+  Basis size (per spin): 56
+  Unique R-vectors for H: 40
+  Unique R-vectors for S: 40
+✓ Parsed atomic basis info: 2 atoms, 56 basis functions
+
+Step 2: Creating spin-block matrices for SOC...
+--------------------------------------------------------------------------------
+✓ Created spin-block matrices: 112×112 (2N×2N with SOC)
+  Number of R-vectors: 39
+
+Step 3: Preparing real-space matrices...
+--------------------------------------------------------------------------------
+✓ Organized 39 R-vectors
+  Total matrix dimension: 112
+
+Step 4: Initializing Wannier90Engine...
+--------------------------------------------------------------------------------
+Using k-grid from CRYSTAL file: (15, 15, 1)
+
+======================================================================
+LCAO-to-Wannier90 Engine Initialized
+======================================================================
+Seedname: test_output/bismuth_path1_auto
+K-grid: (15, 15, 1)
+Number of k-points: 225
+Number of orbitals: 112
+Number of Wannier functions: (to be determined from window)
+Number of R-vectors: 39
+Energy window: [-8.50, 0.00] eV (relative to E_F)
+Fermi energy: -3.7280 eV (user-specified)
+======================================================================
+✓ Atomic info added to engine for phase-corrected MMN (SOC system, doubled basis map)
+
+Step 5: Solving eigenvalue problems...
+--------------------------------------------------------------------------------
+
+======================================================================
+Solving Eigenvalue Problems at 225 K-Points
+======================================================================
+Mode: Parallel
+✓ Eigenvalues converted from Hartree to eV
+✓ Eigenvalue problems solved successfully
+======================================================================
+
+Step 6: Analyzing energy window and selecting bands...
+--------------------------------------------------------------------------------
+
+======================================================================
+Band Window Analysis
+======================================================================
+======================================================================
+BAND WINDOW ANALYSIS
+======================================================================
+Fermi energy: -3.7280 eV
+Outer window: [-12.23, -3.73] eV (absolute)
+              [-8.50, 0.00] eV (relative to E_F)
+
+Band classification:
+  Bands 0-39:   E = [-160.50, -13.71] eV  → EXCLUDED (below window)
+  Bands 40-43:  E = [-8.03, -4.42] eV  → FROZEN ✓
+  Bands 44-45:   E = [-6.49, -3.72] eV  → PARTIAL (crosses upper boundary)
+  Bands 46-111:  E = [-3.67, 1552.10] eV  → EXCLUDED (above window)
+
+----------------------------------------------------------------------
+RESULT:
+  Frozen bands: 4 (indices 40-43)
+  → Setting num_wann = 4
+
+Exact frozen window: [-8.0277, -4.4160] eV
+
+SUGGESTIONS for partial bands:
+  Band 44: To include, expand upper bound to -3.72 eV
+  Band 45: To include, expand upper bound to -3.72 eV
+======================================================================
+⚠ Warning: No unoccupied bands in frozen window!
+======================================================================
+
+Step 7: Writing Wannier90 input files...
+--------------------------------------------------------------------------------
+
+======================================================================
+Writing Wannier90 Files
+======================================================================
+Using 4 selected bands: 40-43
+
+⚠ Warning: No orbital selection performed, using all orbitals
+
+⚠ Warning: test_output/bismuth_path1_auto.nnkp not found
+  Using internally generated neighbors (may not match Wannier90)
+  Recommendation: Run 'wannier90.x -pp test_output/bismuth_path1_auto' first
+  ✓ test_output/bismuth_path1_auto.eig: 900 eigenvalues
+  ✓ test_output/bismuth_path1_auto.amn: 3600 matrix elements
+Traceback (most recent call last):
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 468, in <module>
+    main()
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 455, in main
+    success = test_bismuth_workflow(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 350, in test_bismuth_workflow
+    engine.write_files(
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/lcao_wannier/engine.py", line 694, in write_files
+    write_mmn_file_lcao(
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/lcao_wannier/wannier90.py", line 243, in write_mmn_file_lcao
+    k_next_idx = neighbor['id']
+                 ~~~~~~~~^^^^^^
+TypeError: tuple indices must be integers or slices, not str

@@ -1,19 +1,47 @@
 # LCAO to Wannier90 Conversion Package
 
-Version 1.0.2
+Version 1.3.0
 
 ## Overview
 
 This package provides a complete computational workflow for converting Linear Combination of Atomic Orbitals (LCAO) calculation outputs into input files for Wannier90, enabling maximally localized Wannier function (MLWF) analysis.
+
+## Quick Start - NEW!
+
+**For Bismuth and similar SOC systems, use the automated workflow:**
+
+```bash
+./run_full_workflow.sh bismuth_improved
+```
+
+Follow the printed instructions for preprocessing and Stage 2.
+
+**See [QUICK_REFERENCE.md](QUICK_REFERENCE.md) for common commands and [TWO_STAGE_WORKFLOW.md](TWO_STAGE_WORKFLOW.md) for detailed instructions.**
 
 ## Features
 
 - Parsing of real-space Hamiltonian H(R) and overlap S(R) matrices from LCAO outputs
 - Fourier transformation to momentum space
 - Solution of generalized eigenvalue problems at discrete k-points
-- Generation of Wannier90-compatible file formats (.eig, .amn, .mmn)
+- **Complete Wannier90 file generation** (.win, .eig, .amn, .mmn)
+- **Overlap correction for non-orthogonal LCAO basis** (A = S(k) @ C(k))
+- **Atomic center phase correction for MMN** (exp(-i·b·τ) factor)
+- **Degenerate k-point handling** for reduced-dimensional systems
+- **Full spin-orbit coupling (SOC) support** with spinor wavefunctions
+- Two-stage workflow with Wannier90 preprocessing integration
+- Automatic .win parameter file creation with proper SOC settings
+- Band window analysis and automatic Fermi level detection
+- Disentanglement support for optimal Wannier function localization
 - Numerical verification and validation routines
 - Parallel processing support for large k-point grids
+
+### Recent Fixes (v1.3.0)
+
+✅ Fixed negative Wannier spreads (overlap + phase correction)
+✅ Fixed `**********` overflow in 2D systems (degenerate k-point handling)
+✅ Improved localization (Omega_OD: 559 → <100 Ang²)
+✅ Fixed atom parsing from CRYSTAL output
+✅ Complete two-stage workflow support
 
 ## Installation
 
@@ -92,7 +120,13 @@ Implements Fourier transforms between real and momentum space using phase factor
 Solves the generalized eigenvalue problem H(k)C(k) = S(k)C(k)E(k) using scipy.linalg.eigh. Supports both sequential and parallel processing.
 
 ### wannier90.py
-Writes Wannier90-compatible files (.eig, .amn, .mmn) following the official format specifications.
+Writes Wannier90-compatible data files (.eig, .amn, .mmn) following the official format specifications.
+
+### win_file.py
+**NEW:** Generates Wannier90 .win parameter files with automatic configuration from engine state. Supports custom projections, band structure paths, and advanced Wannier90 options.
+
+### band_selection.py
+Automatic band window analysis, Fermi level detection, and projection orbital selection for optimal Wannier function generation.
 
 ### verification.py
 Provides numerical validation routines including Hermiticity checks and orthonormality verification.
@@ -213,7 +247,16 @@ results = engine.run(parallel=True, verify=True)
 
 ## Output Files
 
-The engine generates three files required by Wannier90:
+The engine generates **all four files** required by Wannier90:
+
+### material.win
+**NEW:** Wannier90 input parameter file containing:
+- System parameters (num_wann, num_bands, lattice vectors)
+- K-point mesh specification
+- Energy windows (if using disentanglement)
+- Atomic positions (optional)
+- Projection specifications
+- Control parameters and output options
 
 ### material.eig
 Band energies at each k-point. Format:
@@ -235,6 +278,8 @@ num_bands  num_kpoints  num_neighbors
 k_index  neighbor_k_index  b1 b2 b3
 M_real  M_imag  (for all m,n pairs)
 ```
+
+**After generation, you can directly run:** `wannier90.x material`
 
 ## Performance Considerations
 

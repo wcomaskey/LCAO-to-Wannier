@@ -26,6 +26,11 @@ from .band_selection import (
     BandWindowResult,
     OrbitalSelectionResult
 )
+from .win_file import (
+    write_win_file,
+    create_win_config_from_engine,
+    Wannier90WinConfig
+)
 
 
 class Wannier90Engine:
@@ -151,7 +156,11 @@ class Wannier90Engine:
         self.k_grid = k_grid
         self.lattice_vectors = lattice_vectors
         self.seedname = seedname
-        
+
+        # Compute reciprocal lattice (needed for neighbor list conversion)
+        # b_i = 2π * (a_j × a_k) / (a_i · (a_j × a_k))
+        self.recip_lattice = 2 * np.pi * np.linalg.inv(lattice_vectors).T
+
         # Band selection parameters
         self.outer_window = outer_window
         self.e_fermi = e_fermi
@@ -194,7 +203,11 @@ class Wannier90Engine:
         self.selected_band_indices = None
         self.selected_orbital_indices = None
         self.orbital_selection_result = None
-        
+
+        # Atomic basis information (for phase-corrected MMN, set later)
+        self.atom_positions = None
+        self.basis_atom_map = None
+
         # Print initialization info
         self._print_init_info()
     
@@ -541,24 +554,58 @@ class Wannier90Engine:
         
         return results
     
-    def write_files(self, verbose: bool = True) -> None:
+    def write_files(
+        self,
+        verbose: bool = True,
+        write_win: bool = True,
+        use_nnkp: bool = True,
+        atoms: Optional[List[Tuple[str, np.ndarray]]] = None,
+        projections: Optional[List[str]] = None,
+        spinors: bool = True,
+        bands_plot: bool = False,
+        kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None
+    ) -> None:
         """
-        Write all Wannier90 input files (.eig, .amn, .mmn).
-        
+        Write all Wannier90 input files (.win, .eig, .amn, .mmn).
+
         Uses only the selected bands if band analysis has been performed.
-        
+
+        IMPORTANT: For best results, run 'wannier90.x -pp seedname' first to
+        generate the .nnkp file, then call this method with use_nnkp=True.
+        This ensures the .mmn file uses exactly the neighbor structure that
+        Wannier90 expects.
+
         Parameters
         ----------
         verbose : bool, optional
             Print progress messages (default: True)
+        write_win : bool, optional
+            Write the .win parameter file (default: True)
+        use_nnkp : bool, optional
+            Use neighbor list from .nnkp file if available (default: True)
+            If True and .nnkp file exists, uses those neighbors
+            If True and .nnkp missing, falls back to generated neighbors with warning
+            If False, always uses internally generated neighbors
+        atoms : list of tuples, optional
+            Atomic positions as [(symbol, frac_coords), ...]
+            If None, atoms section will be omitted from .win file
+        projections : list of str, optional
+            Wannier90 projection specifications
+            If None, uses 'random' (relies on .amn file)
+        spinors : bool, optional
+            Whether calculation includes spin-orbit coupling (default: True)
+        bands_plot : bool, optional
+            Enable band structure plotting in Wannier90 (default: False)
+        kpoint_path : list of tuples, optional
+            High-symmetry path as [(label, coords), ...]
         """
         if not self.eigenvalues_list:
             raise RuntimeError("No results to write. Run solve_all_kpoints() first.")
-        
+
         print(f"\n{'=' * 70}")
         print("Writing Wannier90 Files")
         print(f"{'=' * 70}")
-        
+
         # Determine which bands to use
         if self.selected_band_indices is not None:
             band_indices = self.selected_band_indices
@@ -569,7 +616,7 @@ class Wannier90Engine:
             band_indices = np.arange(self.num_wann)
             if verbose:
                 print(f"Using first {self.num_wann} bands")
-        
+
         # Extract selected bands
         eigenvalues_selected = [
             eig[band_indices] for eig in self.eigenvalues_list
@@ -577,18 +624,131 @@ class Wannier90Engine:
         eigenvectors_selected = [
             C[:, band_indices] for C in self.eigenvectors_list
         ]
-        
-        write_wannier90_files(
-            self.seedname,
-            eigenvalues_selected,
-            eigenvectors_selected,
-            self.S_k_list,
-            self.neighbor_list,
-            self.num_kpoints,
-            len(band_indices),  # Use actual number of selected bands
-            verbose=verbose
-        )
-        
+
+        # Extract selected orbital subspace for projections
+        if self.selected_orbital_indices is not None:
+            orbital_indices = self.selected_orbital_indices
+            S_k_selected = [
+                S_k[orbital_indices, :] for S_k in self.S_k_list
+            ]
+            if verbose:
+                print(f"\n✓ Using {len(orbital_indices)} selected projection orbitals")
+        else:
+            S_k_selected = self.S_k_list
+            if verbose:
+                print(f"\n⚠ Warning: No orbital selection performed, using all orbitals")
+
+        # Determine which neighbor list to use
+        neighbor_list_to_use = self.neighbor_list
+        if use_nnkp:
+            from os.path import exists
+            from .kpoints import read_nnkp_neighbors
+
+            nnkp_file = f"{self.seedname}.nnkp"
+            if exists(nnkp_file):
+                if verbose:
+                    print(f"\n✓ Reading neighbor list from {nnkp_file}")
+                try:
+                    neighbor_list_to_use = read_nnkp_neighbors(nnkp_file)
+                    if verbose:
+                        num_neighbors = len(neighbor_list_to_use[0])
+                        print(f"  Using {num_neighbors} neighbors per k-point from Wannier90")
+                except Exception as e:
+                    print(f"\n⚠ Warning: Could not read {nnkp_file}: {e}")
+                    print(f"  Falling back to internally generated neighbors")
+            else:
+                print(f"\n⚠ Warning: {nnkp_file} not found")
+                print(f"  Using internally generated neighbors (may not match Wannier90)")
+                print(f"  Recommendation: Run 'wannier90.x -pp {self.seedname}' first")
+
+        # Write .eig file
+        from .wannier90 import write_eig_file, write_amn_file, write_mmn_file
+
+        # Shift eigenvalues to be relative to Fermi energy for Wannier90
+        # (when fermi_energy is specified in .win, Wannier90 expects relative energies)
+        eigenvalues_relative = []
+        for eigs in eigenvalues_selected:
+            eigenvalues_relative.append(eigs - self.e_fermi)
+
+        eig_file = f"{self.seedname}.eig"
+        write_eig_file(eig_file, eigenvalues_relative, self.num_kpoints, len(band_indices))
+        if verbose:
+            num_entries = self.num_kpoints * len(band_indices)
+            print(f"  ✓ {eig_file}: {num_entries} eigenvalues (relative to E_F = {self.e_fermi:.6f} eV)")
+
+        # Write .amn file (uses overlap-corrected LCAO projections)
+        amn_file = f"{self.seedname}.amn"
+        # For LCAO methods, use A = S(k) @ C(k) formula
+        if self.selected_orbital_indices is not None:
+            from .wannier90 import write_amn_file_lcao
+            write_amn_file_lcao(
+                amn_file,
+                self.eigenvectors_list,  # Full eigenvectors
+                self.S_k_list,  # Full overlap matrices
+                self.selected_orbital_indices,
+                band_indices,
+                self.num_kpoints,
+                len(band_indices)
+            )
+        else:
+            write_amn_file(amn_file, eigenvectors_selected, S_k_selected, self.num_kpoints, len(band_indices))
+        if verbose:
+            num_entries = self.num_kpoints * len(band_indices) * len(band_indices)
+            print(f"  ✓ {amn_file}: {num_entries} matrix elements")
+
+        # Write .mmn file (with atomic center phase correction if available)
+        mmn_file = f"{self.seedname}.mmn"
+        if self.atom_positions is not None and self.basis_atom_map is not None:
+            # Use phase-corrected LCAO MMN writer
+            from .wannier90 import write_mmn_file_lcao
+
+            # Convert neighbor list to dict format if needed
+            # Old format: List[Tuple[int, np.ndarray]] per k-point
+            # New format: List[Dict[str, Any]] per k-point with 'id', 'G_shift', 'b_vec_cart'
+            if neighbor_list_to_use and isinstance(neighbor_list_to_use[0][0], tuple):
+                # Old format - convert to new
+                print("  ℹ Converting internally generated neighbors to dict format...")
+                from .kpoints import convert_neighbor_list_to_dict_format
+                neighbor_list_to_use = convert_neighbor_list_to_dict_format(
+                    neighbor_list_to_use,
+                    self.recip_lattice
+                )
+
+            write_mmn_file_lcao(
+                mmn_file,
+                eigenvectors_selected,
+                self.S_k_list,
+                neighbor_list_to_use,
+                self.atom_positions,
+                self.basis_atom_map,
+                self.num_kpoints,
+                len(band_indices)
+            )
+        else:
+            # Fallback to standard MMN writer (no phase correction)
+            write_mmn_file(
+                mmn_file, eigenvectors_selected, self.S_k_list, neighbor_list_to_use,
+                self.num_kpoints, len(band_indices)
+            )
+        if verbose:
+            num_neighbors = len(neighbor_list_to_use[0])
+            num_entries = self.num_kpoints * num_neighbors * len(band_indices) * len(band_indices)
+            print(f"  ✓ {mmn_file}: {num_entries} matrix elements")
+
+        # Write parameter file (.win)
+        if write_win:
+            win_config = create_win_config_from_engine(
+                self,
+                atoms=atoms,
+                projections=projections,
+                spinors=spinors,
+                bands_plot=bands_plot,
+                kpoint_path=kpoint_path,
+                write_hr=True,
+                use_bloch_phases=False
+            )
+            write_win_file(self.seedname, win_config, verbose=verbose)
+
         print(f"{'=' * 70}")
     
     def run(
@@ -685,6 +845,7 @@ class Wannier90Engine:
         print("✓ Workflow Completed Successfully!")
         print("=" * 70)
         print(f"Output files created:")
+        print(f"  • {self.seedname}.win - Wannier90 input parameters")
         print(f"  • {self.seedname}.eig - Band energies ({self.num_wann} bands)")
         print(f"  • {self.seedname}.amn - Projection matrices")
         print(f"  • {self.seedname}.mmn - Overlap matrices")

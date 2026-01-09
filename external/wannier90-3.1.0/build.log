@@ -1,0 +1,17 @@
+(cd ./src/obj && /Applications/Xcode.app/Contents/Developer/usr/bin/make -f ../Makefile.2 serialobjs)
+gfortran  -O3 -c ../constants.F90
+gfortran  -O3 -c ../io.F90
+gfortran  -O3 -c ../utility.F90
+gfortran  -O3 -c ../comms.F90
+gfortran  -O3 -c ../parameters.F90
+gfortran  -O3 -c ../ws_distance.F90
+gfortran  -O3 -c ../hamiltonian.F90
+gfortran  -O3 -c ../sitesym.F90
+gfortran  -O3 -c ../overlap.F90
+gfortran  -O3 -c ../kmesh.F90
+gfortran  -O3 -c ../disentangle.F90
+gfortran  -O3 -c ../wannierise.F90
+gfortran  -O3 -c ../plot.F90
+gfortran  -O3 -c ../transport.F90
+(cd ./src/obj && /Applications/Xcode.app/Contents/Developer/usr/bin/make -f ../Makefile.2 wannier)
+gfortran ../wannier_prog.F90   constants.o io.o utility.o parameters.o hamiltonian.o overlap.o kmesh.o disentangle.o ws_distance.o wannierise.o plot.o transport.o sitesym.o comms.o -llapack -lblas -o ../../wannier90.x

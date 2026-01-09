@@ -1,0 +1,122 @@
+================================================================================
+LCAO-to-Wannier90 Test: Bismuth with SOC (basis=40)
+================================================================================
+Input file: /Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/Bismuth_basis_40.out
+Mode: window
+
+Step 1: Parsing CRYSTAL output file...
+--------------------------------------------------------------------------------
+✓ Parsed calculation parameters:
+  Fermi energy: -3.727962 eV
+  Electrons: 46
+  K-grid from file: (15, 15, 1)
+  Number of AOs: 56
+  Number of atoms: 2
+  Total energy: -429.435930 Hartree
+✓ Parsed matrices:
+  Lattice vectors shape: (3, 3)
+  Number of matrix blocks: 200
+  Basis size (per spin): 56
+  Unique R-vectors for H: 40
+  Unique R-vectors for S: 40
+
+Step 2: Creating spin-block matrices for SOC...
+--------------------------------------------------------------------------------
+✓ Created spin-block matrices: 112×112 (2N×2N with SOC)
+  Number of R-vectors: 39
+
+Step 3: Preparing real-space matrices...
+--------------------------------------------------------------------------------
+✓ Organized 39 R-vectors
+  Total matrix dimension: 112
+
+Step 4: Initializing Wannier90Engine...
+--------------------------------------------------------------------------------
+Using k-grid from CRYSTAL file: (15, 15, 1)
+Using default energy window: (-5.0, 3.0) eV
+
+======================================================================
+LCAO-to-Wannier90 Engine Initialized
+======================================================================
+Seedname: ./test_output/bismuth_test
+K-grid: (15, 15, 1)
+Number of k-points: 225
+Number of orbitals: 112
+Number of Wannier functions: (to be determined from window)
+Number of R-vectors: 39
+Energy window: [-5.00, 3.00] eV (relative to E_F)
+Fermi energy: -3.7280 eV (user-specified)
+======================================================================
+
+Step 5: Solving eigenvalue problems...
+--------------------------------------------------------------------------------
+
+======================================================================
+Solving Eigenvalue Problems at 225 K-Points
+======================================================================
+Mode: Parallel
+✓ Eigenvalues converted from Hartree to eV
+✓ Eigenvalue problems solved successfully
+======================================================================
+
+Step 6: Analyzing energy window and selecting bands...
+--------------------------------------------------------------------------------
+
+======================================================================
+Band Window Analysis
+======================================================================
+======================================================================
+BAND WINDOW ANALYSIS
+======================================================================
+Fermi energy: -3.7280 eV
+Outer window: [-8.73, -0.73] eV (absolute)
+              [-5.00, 3.00] eV (relative to E_F)
+
+Band classification:
+  Bands 0-39:   E = [-160.50, -13.71] eV  → EXCLUDED (below window)
+  Bands 40-49:  E = [-8.03, -1.11] eV  → FROZEN ✓
+  Bands 50-51:   E = [-1.12, -0.56] eV  → PARTIAL (crosses upper boundary)
+  Bands 52-111:  E = [4.18, 1552.10] eV  → EXCLUDED (above window)
+
+----------------------------------------------------------------------
+RESULT:
+  Frozen bands: 10 (indices 40-49)
+  → Setting num_wann = 10
+
+Exact frozen window: [-8.0277, -1.1078] eV
+
+SUGGESTIONS for partial bands:
+  Band 50: To include, expand upper bound to -0.56 eV
+  Band 51: To include, expand upper bound to -0.56 eV
+======================================================================
+ℹ Note: Some bands cross the Fermi level (metallic)
+======================================================================
+
+Step 7: Writing Wannier90 input files...
+--------------------------------------------------------------------------------
+
+======================================================================
+Writing Wannier90 Files
+======================================================================
+Using 10 selected bands: 40-49
+
+⚠ Warning: No orbital selection performed, using all orbitals
+
+✓ Reading neighbor list from ./test_output/bismuth_test.nnkp
+  Using 8 neighbors per k-point from Wannier90
+  ✓ ./test_output/bismuth_test.eig: 2250 eigenvalues
+  ✓ ./test_output/bismuth_test.amn: 22500 matrix elements
+Traceback (most recent call last):
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 441, in <module>
+    main()
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 428, in main
+    success = test_bismuth_workflow(
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/tests/test_bismuth_full_workflow.py", line 323, in test_bismuth_workflow
+    engine.write_files(
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/lcao_wannier/engine.py", line 706, in write_files
+    write_mmn_file(
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/lcao_wannier/wannier90.py", line 340, in write_mmn_file
+    for neighbor_idx, b in neighbors:
+        ^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 2)
