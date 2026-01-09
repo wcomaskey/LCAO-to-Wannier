@@ -73,6 +73,7 @@ class CalculationParameters:
     num_shells: Optional[int] = None
     num_ao: Optional[int] = None
     total_energy: Optional[float] = None
+    has_soc: bool = False  # Spin-orbit coupling detected
 
 
 def parse_calculation_parameters(lines: List[str]) -> CalculationParameters:
@@ -157,7 +158,12 @@ def parse_calculation_parameters(lines: List[str]) -> CalculationParameters:
             if match:
                 energy_str = match.group(1).replace('D', 'E').replace('d', 'e')
                 params.total_energy = float(energy_str)
-    
+
+        # Detect spin-orbit coupling from TWO-COMPONENT SCF
+        # Format: "DENSITY MATRIX FROM A TWO-COMPONENT SCF"
+        if 'TWO-COMPONENT' in line and 'SCF' in line:
+            params.has_soc = True
+
     return params
 
 

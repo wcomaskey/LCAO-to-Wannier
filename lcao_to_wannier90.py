@@ -80,16 +80,14 @@ def stage1_create_win(args):
     print(f"  K-grid: {params.k_grid}")
     print(f"  Number of AOs: {params.num_ao}")
 
-    # Determine if we need SOC matrices from raw matrices
-    # Check if we have both alpha and beta spin channels
-    has_soc = False
-    for mat_info in raw_matrices:
-        if mat_info['type'] == 'fock' and 'spin_channel' in mat_info:
-            if mat_info['spin_channel'] == 'beta':
-                has_soc = True
-                break
+    # Use SOC detection from parser (TWO-COMPONENT SCF marker)
+    has_soc = params.has_soc
 
     print(f"  Spin-orbit coupling: {'Yes' if has_soc else 'No'}")
+
+    # If SOC is detected, we need to double the number of orbitals for spinors
+    if has_soc:
+        print(f"  → Doubling orbitals for spinors: {params.num_ao} → {params.num_ao * 2}")
 
     # Organize matrices by R-vector
     print("\nStep 2: Organizing matrices...")
@@ -372,15 +370,14 @@ def stage2_create_data_files(args):
     print(f"  K-grid: {params.k_grid}")
     print(f"  Number of AOs: {params.num_ao}")
 
-    # Determine if we need SOC matrices from raw matrices
-    has_soc = False
-    for mat_info in raw_matrices:
-        if mat_info['type'] == 'fock' and 'spin_channel' in mat_info:
-            if mat_info['spin_channel'] == 'beta':
-                has_soc = True
-                break
+    # Use SOC detection from parser (TWO-COMPONENT SCF marker)
+    has_soc = params.has_soc
 
     print(f"  Spin-orbit coupling: {'Yes' if has_soc else 'No'}")
+
+    # If SOC is detected, we need to double the number of orbitals for spinors
+    if has_soc:
+        print(f"  → Doubling orbitals for spinors: {params.num_ao} → {params.num_ao * 2}")
 
     # Organize matrices by R-vector
     print("\nStep 2: Organizing matrices...")
