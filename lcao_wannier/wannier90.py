@@ -6,7 +6,7 @@ This module contains functions for writing Wannier90 input files
 """
 
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 
 
 def write_eig_file(
@@ -45,6 +45,74 @@ def write_eig_file(
                     f"{band_idx + 1:5d} {k_idx + 1:5d} "
                     f"{eigenvalues[band_idx].real:18.12f}\n"
                 )
+
+
+def write_amn_file_lcao(
+    filename: str,
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    orbital_indices: np.ndarray,
+    band_indices: np.ndarray,
+    num_kpoints: int,
+    num_wann: int
+) -> None:
+    """
+    Write the .amn file for LCAO methods with non-orthogonal basis correction.
+
+    For LCAO methods with non-orthogonal basis, the projection is:
+        A_mn(k) = <χ_m | ψ_n(k)> = [S(k) @ C(k)]_mn
+
+    where:
+    - χ_m are the selected LCAO trial orbitals (projection functions)
+    - ψ_n(k) are the Bloch eigenstates
+    - S(k) is the overlap matrix
+    - C(k) are the eigenvector coefficients
+
+    This accounts for the non-orthogonality of the LCAO basis functions.
+
+    Parameters
+    ----------
+    filename : str
+        Output .amn filename
+    eigenvectors_list : list of ndarray
+        Full eigenvector matrices C(k) for each k-point, shape (num_orbitals, num_bands_all)
+    S_k_list : list of ndarray
+        Full overlap matrices S(k) for each k-point, shape (num_orbitals, num_orbitals)
+    orbital_indices : ndarray
+        Indices of selected projection orbitals
+    band_indices : ndarray
+        Indices of selected bands
+    num_kpoints : int
+        Number of k-points
+    num_wann : int
+        Number of Wannier functions
+    """
+    with open(filename, 'w') as f:
+        # Write header
+        f.write("Created by LCAO-to-Wannier90 (Overlap-Corrected)\n")
+        f.write(f"{num_wann:5d} {num_kpoints:5d} {num_wann:5d}\n")
+
+        # Write projection matrices
+        for k_idx in range(num_kpoints):
+            C_k = eigenvectors_list[k_idx]  # Shape: (num_orbitals, num_bands_all)
+            S_k = S_k_list[k_idx]  # Shape: (num_orbitals, num_orbitals)
+
+            # Compute projection: P = S @ C
+            # This gives <χ_i | ψ_n> for all orbitals i and bands n
+            P_k = S_k @ C_k  # Shape: (num_orbitals, num_bands_all)
+
+            # Extract selected orbitals (rows) and selected bands (columns)
+            A_k = P_k[np.ix_(orbital_indices, band_indices)]  # Shape: (num_wann, num_wann)
+
+            # Write elements: loop over bands m, then projectors n
+            # Wannier90 format: band_idx  wannier_idx  kpoint_idx  Re(A)  Im(A)
+            for m in range(num_wann):
+                for n in range(num_wann):
+                    # Wannier90 uses 1-based indexing
+                    f.write(
+                        f"{m + 1:5d} {n + 1:5d} {k_idx + 1:5d} "
+                        f"{A_k[n, m].real:18.12f} {A_k[n, m].imag:18.12f}\n"
+                    )
 
 
 def write_amn_file(
@@ -91,9 +159,21 @@ def write_amn_file(
         for k_idx in range(num_kpoints):
             C_k = eigenvectors_list[k_idx]
             S_k = S_k_list[k_idx]
-            
-            # Compute A(k) = S(k)† C(k)
-            A_k = S_k.conj().T @ C_k
+
+            # For LCAO methods: A(k) = projection of eigenvectors onto selected orbitals
+            # If S_k is a projection subspace matrix (num_wann x num_orbitals),
+            # it contains the selected orbital indices via row selection.
+            # The projection is simply the selected rows of C_k.
+            if S_k.shape[0] == num_wann and S_k.shape[0] < S_k.shape[1]:
+                # S_k indicates which orbitals to use via its row structure
+                # For LCAO: A_mn(k) = C_mn(k) where m are selected orbital indices
+                # We need to extract which orbitals S_k represents
+                # Actually, S_k rows ARE the projections: A(k) = S_k @ C_k normalizes them
+                A_k = S_k @ C_k
+            else:
+                # S_k is the full overlap matrix (num_orbitals x num_orbitals)
+                # Use traditional formula: A(k) = S(k)† C(k)
+                A_k = S_k.conj().T @ C_k
             
             # Write elements: loop over bands m, then projectors n
             for m in range(num_wann):
@@ -103,6 +183,104 @@ def write_amn_file(
                         f"{m + 1:5d} {n + 1:5d} {k_idx + 1:5d} "
                         f"{A_k[n, m].real:18.12f} {A_k[n, m].imag:18.12f}\n"
                     )
+
+
+def write_mmn_file_lcao(
+    filename: str,
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    neighbor_list: Dict[int, List[Dict[str, Any]]],
+    atom_positions: np.ndarray,
+    basis_atom_map: np.ndarray,
+    num_kpoints: int,
+    num_wann: int
+) -> None:
+    """
+    Write the .mmn file for LCAO methods with atomic center phase correction.
+
+    Implements the corrected formula:
+        M_mn(k,b) = C†_m(k) @ S_phase(k+b) @ C_n(k+b)
+
+    where S_phase is the phase-shifted overlap matrix:
+        S_phase_μν(k+b) = S_μν(k+b) * exp(-i * b · τ_μ)
+
+    This accounts for the cell-periodic parts u(k) instead of Bloch states ψ(k).
+
+    Parameters
+    ----------
+    filename : str
+        Output .mmn filename
+    eigenvectors_list : list of ndarray
+        Eigenvector matrices C(k), shape (num_orbitals, num_bands)
+    S_k_list : list of ndarray
+        Overlap matrices S(k), shape (num_orbitals, num_orbitals)
+    neighbor_list : dict
+        Maps k_idx -> list of neighbor dicts with keys:
+            'id': neighbor k-point index
+            'G_shift': integer lattice vector (n1, n2, n3)
+            'b_vec_cart': Cartesian b-vector in Angstrom
+    atom_positions : ndarray
+        Atomic positions in Cartesian Angstrom, shape (num_atoms, 3)
+    basis_atom_map : ndarray
+        Maps basis function index to atom index, shape (num_basis,)
+    num_kpoints : int
+        Number of k-points
+    num_wann : int
+        Number of Wannier functions (selected bands)
+    """
+    with open(filename, 'w') as f:
+        # Write header
+        f.write("Created by LCAO-to-Wannier90 (Phase-Corrected)\n")
+        num_neighbors = len(neighbor_list[0])
+        f.write(f"{num_wann:5d} {num_kpoints:5d} {num_neighbors:5d}\n")
+
+        # Process each k-point
+        for k_idx in range(num_kpoints):
+            C_k = eigenvectors_list[k_idx]  # Shape: (num_orbitals, num_wann)
+
+            # Process each neighbor
+            for neighbor in neighbor_list[k_idx]:
+                k_next_idx = neighbor['id']
+                G_shift = neighbor['G_shift']
+                b_vec_cart = neighbor['b_vec_cart']  # Cartesian b-vector
+
+                C_next = eigenvectors_list[k_next_idx]
+                S_next = S_k_list[k_next_idx]  # Shape: (num_orbitals, num_orbitals)
+
+                # --- SPECIAL HANDLING FOR DEGENERATE K-POINTS ---
+                # When k+b wraps to the same k-point (e.g., z-direction in 2D with nz=1),
+                # we should NOT apply phase correction as it's spurious.
+                # The overlap should simply be the identity matrix for eigenvectors.
+                if k_next_idx == k_idx:
+                    # Degenerate case: k+b = k (after wrapping)
+                    # Use unprojected overlap (should be ~identity for orthonormal eigenvectors)
+                    # For LCAO, C†(k) S(k) C(k) should give identity if C diagonalizes S^-1 F
+                    M_kb = C_k.conj().T @ S_next @ C_next  # Shape: (num_wann, num_wann)
+                else:
+                    # Normal case: k+b ≠ k
+                    # Apply atomic center phase correction
+                    # Compute phase factors: exp(-i * b · τ_μ) for each basis function μ
+                    relevant_atom_pos = atom_positions[basis_atom_map]  # Shape: (num_orbitals, 3)
+                    dot_products = np.dot(relevant_atom_pos, b_vec_cart)  # Shape: (num_orbitals,)
+                    phase_factors = np.exp(-1j * dot_products)  # Shape: (num_orbitals,)
+
+                    # Apply phase to rows of S_next (multiply rows by phase)
+                    S_phase_shifted = phase_factors[:, np.newaxis] * S_next  # Broadcasting
+
+                    # --- COMPUTE OVERLAP MATRIX ---
+                    # M(k,b) = C†(k) @ S_phase(k+b) @ C(k+b)
+                    M_kb = C_k.conj().T @ S_phase_shifted @ C_next  # Shape: (num_wann, num_wann)
+
+                # --- WRITE TO FILE ---
+                # Write neighbor identification line
+                f.write(f"{k_idx+1:5d} {k_next_idx+1:5d} "
+                       f"{G_shift[0]:5d} {G_shift[1]:5d} {G_shift[2]:5d}\n")
+
+                # Write matrix elements (column-major order for Fortran compatibility)
+                for n in range(num_wann):
+                    for m in range(num_wann):
+                        val = M_kb[m, n]
+                        f.write(f"{val.real:18.12f} {val.imag:18.12f}\n")
 
 
 def write_mmn_file(
@@ -115,9 +293,9 @@ def write_mmn_file(
 ) -> None:
     """
     Write the .mmn file containing overlap matrices M(k,b).
-    
+
     M(k,b) = C†(k) S(k+b) C(k+b)
-    
+
     Format:
         Header: num_bands  num_kpoints  num_neighbors
         For each k-point and neighbor:

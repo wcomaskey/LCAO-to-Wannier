@@ -24,7 +24,7 @@ organize_matrices_by_lattice_vector : function
     Organize raw matrices by lattice vector and spin channel
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __author__ = "William Comaskey"
 
 # Main engine class
@@ -34,10 +34,12 @@ from .engine import Wannier90Engine
 from .parser import (
     parse_overlap_and_fock_matrices,
     parse_calculation_parameters,  # NEW
+    parse_atomic_basis_info,  # NEW
     create_spin_block_matrices,
     fill_raw_matrix,
     is_hermitian,
     CalculationParameters,  # NEW
+    AtomicBasisInfo,  # NEW
 )
 
 # Utility functions
@@ -55,6 +57,7 @@ from .utils import (
 from .kpoints import (
     generate_kpoint_grid,
     generate_neighbor_list,
+    read_nnkp_neighbors,
     kpoint_index_to_grid,
     grid_to_kpoint_index,
 )
@@ -92,6 +95,19 @@ from .wannier90 import (
     write_wannier90_files,
 )
 
+# Win file writer
+from .win_file import (
+    write_win_file,
+    create_win_config_from_engine,
+    parse_atoms_from_crystal_output,
+    Wannier90WinConfig,
+    KPATH_HEXAGONAL_2D,
+    KPATH_SQUARE_2D,
+    KPATH_FCC,
+    KPATH_BCC,
+    KPATH_SIMPLE_CUBIC,
+)
+
 from .band_selection import (
     estimate_fermi_energy,
     analyze_band_window,
@@ -116,7 +132,9 @@ __all__ = [
     'fill_raw_matrix',
     'is_hermitian',
     'parse_calculation_parameters',
+    'parse_atomic_basis_info',
     'CalculationParameters',
+    'AtomicBasisInfo',
     
     # Utils
     'prepare_real_space_matrices',
@@ -157,4 +175,25 @@ __all__ = [
     'write_amn_file',
     'write_mmn_file',
     'write_wannier90_files',
+    'write_win_file',
+    'create_win_config_from_engine',
+    'parse_atoms_from_crystal_output',
+    'Wannier90WinConfig',
+    'KPATH_HEXAGONAL_2D',
+    'KPATH_SQUARE_2D',
+    'KPATH_FCC',
+    'KPATH_BCC',
+    'KPATH_SIMPLE_CUBIC',
+
+    # Band selection
+    'estimate_fermi_energy',
+    'analyze_band_window',
+    'print_band_analysis',
+    'check_frozen_continuity',
+    'validate_fermi_coverage',
+    'select_projection_orbitals',
+    'compute_subspace_projections',
+    'suggest_optimal_window',
+    'BandWindowResult',
+    'OrbitalSelectionResult',
 ]

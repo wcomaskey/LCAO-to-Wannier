@@ -161,6 +161,181 @@ def parse_calculation_parameters(lines: List[str]) -> CalculationParameters:
     return params
 
 
+@dataclass
+class AtomicBasisInfo:
+    """
+    Information about atomic positions and basis function mapping.
+
+    Attributes
+    ----------
+    atom_positions : ndarray
+        Cartesian coordinates of atoms in Angstroms, shape (num_atoms, 3)
+    atom_symbols : list of str
+        Chemical symbols for each atom
+    basis_atom_map : ndarray
+        Maps each basis function index to its atom index, shape (num_basis,)
+    num_atoms : int
+        Total number of atoms
+    num_basis : int
+        Total number of basis functions
+    """
+    atom_positions: np.ndarray
+    atom_symbols: List[str]
+    basis_atom_map: np.ndarray
+    num_atoms: int
+    num_basis: int
+
+
+def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
+    """
+    Parse atomic positions and basis-to-atom mapping from CRYSTAL output.
+
+    Extracts information from the "LOCAL ATOMIC FUNCTIONS BASIS SET" section,
+    which contains atom positions in Bohr and the organization of basis functions.
+
+    Parameters
+    ----------
+    lines : list of str
+        Lines from the CRYSTAL output file
+
+    Returns
+    -------
+    AtomicBasisInfo
+        Dataclass containing atomic positions and basis mapping
+
+    Notes
+    -----
+    The BASIS SET section has format:
+    ```
+    LOCAL ATOMIC FUNCTIONS BASIS SET
+       ATOM   X(AU)   Y(AU)   Z(AU)  N. TYPE  EXPONENT  ...
+       1 BI   2.342   0.000   1.698
+                                    1 S
+                                    ...
+                              5-     7 P
+                                    ...
+       2 BI  -2.342  -0.000  -1.698
+                                   29 S
+                                    ...
+    ```
+
+    Examples
+    --------
+    >>> with open('crystal.out', 'r') as f:
+    ...     lines = f.readlines()
+    >>> info = parse_atomic_basis_info(lines)
+    >>> print(f"Atom 0 position: {info.atom_positions[0]} Angstrom")
+    >>> print(f"Basis function 10 belongs to atom {info.basis_atom_map[10]}")
+    """
+    # Conversion factor: Bohr to Angstrom
+    BOHR_TO_ANGSTROM = 0.529177210903
+
+    # Find the LOCAL ATOMIC FUNCTIONS BASIS SET section
+    start_idx = None
+    for i, line in enumerate(lines):
+        if 'LOCAL ATOMIC FUNCTIONS BASIS SET' in line:
+            start_idx = i + 1  # Start from next line (asterisks)
+            break
+
+    if start_idx is None:
+        raise ValueError("Could not find 'LOCAL ATOMIC FUNCTIONS BASIS SET' section")
+
+    atom_positions_bohr = []
+    atom_symbols = []
+    basis_ranges = []  # List of (atom_idx, first_basis, last_basis)
+    current_atom = None
+
+    # Pattern to match basis function ranges: "  1 S  " or "  5-     7 P  "
+    basis_single_pattern = re.compile(r'^\s+(\d+)\s+([SPDFG])\s*$')
+    basis_range_pattern = re.compile(r'^\s+(\d+)-\s+(\d+)\s+([SPDFG])\s*$')
+
+    i = start_idx
+    while i < len(lines):
+        line = lines[i]
+
+        # Check for end of section (usually OVERLAP MATRIX or empty line with asterisks)
+        if 'OVERLAP MATRIX' in line or ('*****' in line and i > start_idx + 5):
+            break
+
+        # Try to match atom header by splitting
+        # Format: "   1 BI   2.342   0.000   1.698"
+        parts = line.split()
+        if len(parts) >= 5:
+            try:
+                atom_idx_test = int(parts[0])
+                # Check if this looks like an atom line (symbol is all letters)
+                if parts[1].isalpha() and parts[1].isupper():
+                    atom_idx = atom_idx_test - 1  # Convert to 0-based
+                    symbol = parts[1]
+                    x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+
+                    atom_positions_bohr.append([x, y, z])
+                    atom_symbols.append(symbol)
+                    current_atom = atom_idx
+                    i += 1
+                    continue
+            except (ValueError, IndexError):
+                pass
+
+        # Try to match basis function single index
+        match = basis_single_pattern.match(line)
+        if match and current_atom is not None:
+            basis_idx = int(match.group(1)) - 1  # Convert to 0-based
+            basis_ranges.append((current_atom, basis_idx, basis_idx))
+            i += 1
+            continue
+
+        # Try to match basis function range
+        match = basis_range_pattern.match(line)
+        if match and current_atom is not None:
+            first_basis = int(match.group(1)) - 1  # Convert to 0-based
+            last_basis = int(match.group(2)) - 1
+            basis_ranges.append((current_atom, first_basis, last_basis))
+            i += 1
+            continue
+
+        i += 1
+
+    if not atom_positions_bohr:
+        raise ValueError("No atomic positions found in BASIS SET section")
+
+    # Convert positions to Angstrom
+    atom_positions = np.array(atom_positions_bohr) * BOHR_TO_ANGSTROM
+
+    # Determine total number of basis functions
+    if basis_ranges:
+        # Number of basis functions explicitly listed for first atom
+        num_basis_per_atom = max(end for _, start, end in basis_ranges) + 1
+        # Total basis functions = num_basis_per_atom * num_atoms
+        num_basis = num_basis_per_atom * len(atom_symbols)
+    else:
+        # Fallback: try to infer from OVERLAP MATRIX
+        raise ValueError("Could not determine number of basis functions from BASIS SET")
+
+    # Create basis-to-atom mapping
+    basis_atom_map = np.zeros(num_basis, dtype=int)
+
+    # If only first atom has explicit basis ranges, assume symmetry
+    if basis_ranges and all(atom_idx == 0 for atom_idx, _, _ in basis_ranges):
+        # Fill in symmetrically for all atoms
+        for atom_idx in range(len(atom_symbols)):
+            start_basis = atom_idx * num_basis_per_atom
+            end_basis = (atom_idx + 1) * num_basis_per_atom
+            basis_atom_map[start_basis:end_basis] = atom_idx
+    else:
+        # Use explicit ranges
+        for atom_idx, first, last in basis_ranges:
+            basis_atom_map[first:last+1] = atom_idx
+
+    return AtomicBasisInfo(
+        atom_positions=atom_positions,
+        atom_symbols=atom_symbols,
+        basis_atom_map=basis_atom_map,
+        num_atoms=len(atom_symbols),
+        num_basis=num_basis
+    )
+
+
 # ==============================
 # Matrix Utility Functions
 # ==============================
