@@ -1,0 +1,16 @@
+================================================================================
+FINDING ENERGY WINDOW FOR 18 BANDS
+================================================================================
+
+System Information:
+  Fermi energy: -3.727962 eV
+  K-grid: (15, 15, 1)
+
+Solving eigenvalue problems to get band structure...
+Traceback (most recent call last):
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/find_window_for_bands.py", line 154, in <module>
+    find_window_for_target_bands('tests/Bismuth_basis_40.out', args.target_bands)
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/find_window_for_bands.py", line 45, in find_window_for_target_bands
+    eigenvalues_list, eigenvectors_list = solve_all_kpoints_parallel(raw_matrices)
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: solve_all_kpoints_parallel() missing 3 required positional arguments: 'real_space_matrices', 'lattice_vectors', and 'num_wann'

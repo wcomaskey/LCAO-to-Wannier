@@ -1,3 +1,12 @@
- Wannier90: Execution started on  8Jan2026 at 21:09:33 
+ Wannier90: Execution started on 10Jan2026 at 18:39:35 
+Found a mismatch in bismuth_test.eig
+Wanted band  : 15 found band  : 1
+Wanted kpoint: 1 found kpoint: 2
+ 
+A common cause of this error is using the wrong
+number of bands. Check your input files.
+If your pseudopotentials have shallow core states remember
+to account for these electrons.
+ 
  Exiting.......
- Error: Problem opening input file bismuth_test.win
+ param_read: mismatch in bismuth_test.eig

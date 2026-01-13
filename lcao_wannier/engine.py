@@ -676,6 +676,37 @@ class Wannier90Engine:
             num_entries = self.num_kpoints * len(band_indices)
             print(f"  ✓ {eig_file}: {num_entries} eigenvalues (relative to E_F = {self.e_fermi:.6f} eV)")
 
+        # DISABLED: Auto-update feature commented out to allow num_bands > actual bands in window
+        # This is needed for disentanglement where num_bands should be > num_wann
+        #
+        # # Validate/update .win file's num_bands to match .eig file
+        # actual_bands_written = len(band_indices)
+        # win_file = f"{self.seedname}.win"
+        #
+        # try:
+        #     from .win_file import read_win_parameter, update_win_parameter
+        #     current_num_bands = read_win_parameter(win_file, 'num_bands')
+        #
+        #     if current_num_bands is not None and current_num_bands != actual_bands_written:
+        #         if verbose:
+        #             print(f"\n⚠ IMPORTANT: Updating {win_file}")
+        #             print(f"  num_bands: {current_num_bands} → {actual_bands_written}")
+        #             print(f"  Reason: Energy window contains {actual_bands_written} bands, not {current_num_bands}")
+        #
+        #         update_win_parameter(win_file, 'num_bands', actual_bands_written)
+        #
+        #         if verbose:
+        #             print(f"  ✓ Updated {win_file}")
+        #             print()
+        #             print(f"  {'='*76}")
+        #             print(f"  NEXT STEPS:")
+        #             print(f"  1. Re-run preprocessing: wannier90.x -pp {self.seedname}")
+        #             print(f"  2. Re-run Stage 2:       python3 lcao_to_wannier90.py --stage 2 ...")
+        #             print(f"  {'='*76}")
+        # except Exception as e:
+        #     if verbose:
+        #         print(f"\n⚠ Warning: Could not validate/update .win file: {e}")
+
         # Write .amn file (uses overlap-corrected LCAO projections)
         amn_file = f"{self.seedname}.amn"
         # For LCAO methods, use A = S(k) @ C(k) formula
@@ -717,12 +748,15 @@ class Wannier90Engine:
             write_mmn_file_lcao(
                 mmn_file,
                 eigenvectors_selected,
-                self.S_k_list,
+                self.kpoints,
+                self.real_space_matrices,
+                self.lattice_vectors,
                 neighbor_list_to_use,
                 self.atom_positions,
                 self.basis_atom_map,
                 self.num_kpoints,
-                len(band_indices)
+                len(band_indices),
+                convention='pi'
             )
         else:
             # Fallback to standard MMN writer (no phase correction)

@@ -689,3 +689,114 @@ KPATH_SIMPLE_CUBIC = [
     ('M', np.array([0.5, 0.5, 0.0])),
     ('R', np.array([0.5, 0.5, 0.5])),
 ]
+
+
+def read_win_parameter(filename: str, parameter: str) -> Optional[Any]:
+    """
+    Read a single parameter from a .win file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to .win file
+    parameter : str
+        Parameter name (e.g., 'num_bands', 'num_wann')
+
+    Returns
+    -------
+    value : int, float, bool, str, or None
+        Parameter value, or None if not found
+
+    Examples
+    --------
+    >>> num_bands = read_win_parameter('material.win', 'num_bands')
+    >>> print(num_bands)
+    16
+    """
+    import re
+
+    with open(filename, 'r') as f:
+        for line in f:
+            # Skip comments and empty lines
+            if line.strip().startswith('!') or not line.strip():
+                continue
+
+            # Match "parameter = value"
+            match = re.match(rf'^\s*{parameter}\s*=\s*(.+)', line, re.IGNORECASE)
+            if match:
+                value_str = match.group(1).strip()
+
+                # Try to parse as int
+                try:
+                    return int(value_str)
+                except ValueError:
+                    pass
+
+                # Try to parse as float
+                try:
+                    return float(value_str)
+                except ValueError:
+                    pass
+
+                # Check for boolean
+                if value_str.upper() in ['.TRUE.', 'T', 'TRUE']:
+                    return True
+                if value_str.upper() in ['.FALSE.', 'F', 'FALSE']:
+                    return False
+
+                # Return as string
+                return value_str
+
+    return None
+
+
+def update_win_parameter(filename: str, parameter: str, value: Any) -> None:
+    """
+    Update a single parameter in a .win file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to .win file
+    parameter : str
+        Parameter name (e.g., 'num_bands')
+    value : int, float, bool, or str
+        New value
+
+    Examples
+    --------
+    >>> update_win_parameter('material.win', 'num_bands', 14)
+    """
+    import re
+
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    # Format value
+    if isinstance(value, bool):
+        value_str = '.true.' if value else '.false.'
+    else:
+        value_str = str(value)
+
+    # Find and update parameter
+    updated = False
+    for i, line in enumerate(lines):
+        # Skip comments
+        if line.strip().startswith('!'):
+            continue
+
+        # Match "parameter = old_value"
+        match = re.match(rf'^\s*{parameter}\s*=\s*(.+)', line, re.IGNORECASE)
+        if match:
+            # Preserve indentation
+            indent = len(line) - len(line.lstrip())
+            lines[i] = ' ' * indent + f'{parameter} = {value_str}\n'
+            updated = True
+            break
+
+    if not updated:
+        raise ValueError(f"Parameter '{parameter}' not found in {filename}")
+
+    # Write back
+    with open(filename, 'w') as f:
+        f.writelines(lines)

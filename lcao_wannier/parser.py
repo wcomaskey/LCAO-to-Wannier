@@ -180,6 +180,8 @@ class AtomicBasisInfo:
         Chemical symbols for each atom
     basis_atom_map : ndarray
         Maps each basis function index to its atom index, shape (num_basis,)
+    orbital_types : dict, optional
+        Maps orbital index (1-indexed) to orbital type ('s', 'p', 'd', 'f', 'g')
     num_atoms : int
         Total number of atoms
     num_basis : int
@@ -188,8 +190,9 @@ class AtomicBasisInfo:
     atom_positions: np.ndarray
     atom_symbols: List[str]
     basis_atom_map: np.ndarray
-    num_atoms: int
-    num_basis: int
+    orbital_types: Optional[Dict[int, str]] = None
+    num_atoms: int = 0
+    num_basis: int = 0
 
 
 def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
@@ -340,6 +343,127 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
         num_atoms=len(atom_symbols),
         num_basis=num_basis
     )
+
+
+def parse_orbital_types(lines: List[str], has_soc: bool = False, num_atoms: Optional[int] = None) -> Dict[int, str]:
+    """
+    Parse orbital type (S, P, D, F, G) for each basis function from CRYSTAL output.
+
+    Extracts orbital angular momentum type from the "LOCAL ATOMIC FUNCTIONS BASIS SET"
+    section. For systems with spin-orbit coupling, the mapping is doubled to account
+    for spinor components.
+
+    Parameters
+    ----------
+    lines : list of str
+        Lines from the CRYSTAL output file
+    has_soc : bool
+        Whether spin-orbit coupling is enabled (doubles the orbital count)
+    num_atoms : int, optional
+        Number of atoms (for replicating orbital types across atoms)
+        If not provided, auto-detected from atomic basis info
+
+    Returns
+    -------
+    dict
+        Dictionary mapping orbital_index (1-indexed) → orbital_type ('s', 'p', 'd', 'f', 'g')
+
+    Examples
+    --------
+    >>> with open('crystal.out', 'r') as f:
+    ...     lines = f.readlines()
+    >>> orbital_types = parse_orbital_types(lines, has_soc=True)
+    >>> orbital_types[1]
+    's'
+    >>> orbital_types[5]
+    'p'
+
+    Notes
+    -----
+    Orbital indices are 1-indexed to match CRYSTAL convention.
+    The BASIS SET section format:
+        1 S         ← orbital 1 is S type
+        2 S         ← orbital 2 is S type
+      5-     7 P    ← orbitals 5-7 are P type
+     14-    18 D    ← orbitals 14-18 are D type
+
+    For SOC systems, the orbital count is doubled (each spatial orbital has 2 spinor components),
+    so we duplicate the mapping.
+    """
+    orbital_types = {}
+
+    # Find the LOCAL ATOMIC FUNCTIONS BASIS SET section
+    in_basis_section = False
+    orbital_type_pattern = re.compile(r'^\s*(\d+)(?:-\s*(\d+))?\s+([SPDFG])')
+
+    for line in lines:
+        if 'LOCAL ATOMIC FUNCTIONS BASIS SET' in line:
+            in_basis_section = True
+            continue
+
+        if in_basis_section:
+            # End of BASIS SET section
+            if line.strip().startswith('*****') or line.strip() == '' or 'INFORMATION' in line:
+                # Check if we've reached the end
+                if orbital_types:  # Only break if we've found some orbitals
+                    break
+
+            # Try to match orbital type lines
+            match = orbital_type_pattern.match(line)
+            if match:
+                start_idx = int(match.group(1))
+                end_idx_str = match.group(2)
+                orb_type = match.group(3).lower()
+
+                if end_idx_str:
+                    # Range of orbitals (e.g., "5- 7 P")
+                    end_idx = int(end_idx_str)
+                    for idx in range(start_idx, end_idx + 1):
+                        orbital_types[idx] = orb_type
+                else:
+                    # Single orbital (e.g., "1 S")
+                    orbital_types[start_idx] = orb_type
+
+    if not orbital_types:
+        return {}
+
+    # Replicate orbital types for all atoms
+    # The BASIS SET section typically lists one atom's orbitals
+    # We need to replicate this pattern for each atom
+    orbitals_per_atom = max(orbital_types.keys())
+
+    # Auto-detect number of atoms if not provided
+    if num_atoms is None:
+        # Try to parse from atomic basis info
+        try:
+            atomic_info = parse_atomic_basis_info(lines)
+            num_atoms = atomic_info.num_atoms
+        except:
+            num_atoms = 1  # Default to 1 atom if parsing fails
+
+    # Replicate for all atoms
+    all_orbital_types = {}
+    for atom_idx in range(num_atoms):
+        offset = atom_idx * orbitals_per_atom
+        for orb_idx, orb_type in orbital_types.items():
+            all_orbital_types[orb_idx + offset] = orb_type
+
+    # For SOC systems, double the mapping (each spatial orbital → 2 spinor components)
+    if has_soc:
+        num_spatial_orbitals = max(all_orbital_types.keys())
+        soc_orbital_types = {}
+
+        # Copy original mapping
+        for idx, orb_type in all_orbital_types.items():
+            soc_orbital_types[idx] = orb_type
+
+        # Add spinor duplicates (shifted by num_spatial_orbitals)
+        for idx, orb_type in all_orbital_types.items():
+            soc_orbital_types[idx + num_spatial_orbitals] = orb_type
+
+        return soc_orbital_types
+
+    return all_orbital_types
 
 
 # ==============================

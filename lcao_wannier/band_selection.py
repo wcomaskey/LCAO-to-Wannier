@@ -250,6 +250,60 @@ def analyze_band_window(
     )
 
 
+def select_bands_near_fermi(
+    band_indices: np.ndarray,
+    band_ranges: List[Tuple[float, float]],
+    e_fermi: float,
+    num_bands: int
+) -> np.ndarray:
+    """
+    Select bands closest to Fermi level.
+
+    This function selects the bands whose center energies are closest to
+    the Fermi level, rather than simply taking the first N bands by index.
+    This ensures physically meaningful band selection for Wannierization.
+
+    Parameters
+    ----------
+    band_indices : ndarray
+        Available band indices to select from
+    band_ranges : list of tuples
+        (E_min, E_max) for each band across all k-points
+    e_fermi : float
+        Fermi energy
+    num_bands : int
+        Number of bands to select
+
+    Returns
+    -------
+    selected_bands : ndarray
+        Selected band indices, sorted in ascending order
+
+    Examples
+    --------
+    >>> band_indices = np.array([20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+    >>> band_ranges = [(-5.0, -4.5), (-4.8, -4.2), ..., (2.0, 2.5)]
+    >>> e_fermi = -3.728
+    >>> selected = select_bands_near_fermi(band_indices, band_ranges, e_fermi, 5)
+    >>> # Returns the 5 bands with centers closest to -3.728 eV
+    """
+    if num_bands >= len(band_indices):
+        return np.sort(band_indices)
+
+    # Compute center energy of each band
+    band_centers = np.array([
+        (band_ranges[i][0] + band_ranges[i][1]) / 2
+        for i in band_indices
+    ])
+
+    # Sort by distance from Fermi level
+    distances = np.abs(band_centers - e_fermi)
+    sorted_positions = np.argsort(distances)
+    selected = band_indices[sorted_positions[:num_bands]]
+
+    return np.sort(selected)
+
+
 def print_band_analysis(result: BandWindowResult, verbose: bool = True) -> str:
     """
     Generate a human-readable report of band window analysis.

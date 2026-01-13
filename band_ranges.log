@@ -1,0 +1,20 @@
+================================================================================
+BAND ENERGY RANGES ANALYSIS
+================================================================================
+
+Reading CRYSTAL output file...
+System Information:
+  Fermi energy: -3.727962 eV
+  K-grid: (15, 15, 1)
+  Total k-points: 225
+
+Solving eigenvalue problems at all k-points...
+Traceback (most recent call last):
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/show_band_ranges.py", line 233, in <module>
+    main()
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/show_band_ranges.py", line 229, in main
+    show_band_ranges(args.input, args.num_wann, args.target_bands)
+  File "/Users/williamcomaskey/Documents/GitHub/LCAO-to-Wannier/show_band_ranges.py", line 53, in show_band_ranges
+    eigenvalues_list, eigenvectors_list = solve_all_kpoints_parallel(raw_matrices)
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: solve_all_kpoints_parallel() missing 3 required positional arguments: 'real_space_matrices', 'lattice_vectors', and 'num_wann'

@@ -1,0 +1,171 @@
+=== Re-running Workflow with Correct Energy Windows ===
+
+Current bismuth.win configuration:
+  num_wann = 12
+  num_bands = 12
+  Energy window: [-12.0, 6.0] eV
+
+The issue: Previous Stage 2 run used wrong window (default [-5,3] eV)
+The fix: Re-run Stage 2 with correct window matching .win file
+
+Step 1: Re-running Wannier90 preprocessing...
+Command: ./external/wannier90-3.1.0/wannier90.x -pp bismuth
+✓ Generated bismuth.nnkp
+
+Step 2: Running Stage 2 with energy window [-12.0, 6.0] eV...
+Command: python3 lcao_to_wannier90.py --stage 2 --input tests/Bismuth_basis_40.out --seedname bismuth --window -12.0 6.0
+
+================================================================================
+STAGE 2: Creating Wannier90 Data Files (.eig, .amn, .mmn)
+================================================================================
+Input file: tests/Bismuth_basis_40.out
+Seedname: bismuth
+
+✓ Found bismuth.nnkp
+✓ Found bismuth.win
+
+Step 1: Parsing CRYSTAL/LCAO output file...
+--------------------------------------------------------------------------------
+✓ Parsed calculation parameters:
+  Fermi energy: -3.727962 eV
+  K-grid: (15, 15, 1)
+  Number of AOs: 56
+  Spin-orbit coupling: Yes
+  → Doubling orbitals for spinors: 56 → 112
+
+Step 2: Organizing matrices...
+--------------------------------------------------------------------------------
+✓ Organized matrices
+  Basis size: 56
+  Unique R-vectors for H: 40
+  Unique R-vectors for S: 40
+
+Step 3: Creating matrices...
+--------------------------------------------------------------------------------
+✓ Created 112×112 SOC matrices
+
+Step 4: Preparing real-space matrices...
+--------------------------------------------------------------------------------
+✓ Prepared 39 R-vectors
+
+Step 5: Reading parameters from .win file...
+--------------------------------------------------------------------------------
+  Found num_wann = 12
+  Found num_bands = 12
+✓ Read parameters from bismuth.win
+
+Step 6: Determining energy window...
+--------------------------------------------------------------------------------
+Using user-specified window: [-12.00, 6.00] eV
+
+Step 7: Initializing Wannier90 engine...
+--------------------------------------------------------------------------------
+
+======================================================================
+LCAO-to-Wannier90 Engine Initialized
+======================================================================
+Seedname: bismuth
+K-grid: (15, 15, 1)
+Number of k-points: 225
+Number of orbitals: 112
+Number of Wannier functions: 12 (user-specified)
+Number of R-vectors: 39
+Energy window: [-12.00, 6.00] eV (relative to E_F)
+Fermi energy: -3.7280 eV (user-specified)
+======================================================================
+✓ Engine initialized
+
+Parsing atomic basis information...
+✓ Parsed 2 atoms, 56 basis functions (SOC: doubled basis map)
+
+Step 7: Solving eigenvalue problems...
+--------------------------------------------------------------------------------
+
+======================================================================
+Solving Eigenvalue Problems at 225 K-Points
+======================================================================
+Mode: Parallel
+✓ Eigenvalues converted from Hartree to eV
+✓ Eigenvalue problems solved successfully
+======================================================================
+✓ Eigenvalue problems solved
+
+Step 8: Analyzing band structure and selecting bands...
+--------------------------------------------------------------------------------
+Using num_wann = 12 and num_bands = 12 from .win file
+Selecting 12 bands from 16 available in window
+  Strategy: Closest to Fermi level (E_F = -3.7280 eV)
+  Selected band indices: 40-51 (1-based: 41-52)
+  Selected energy range: [-6.93, -0.84] eV
+  Distance from E_F: 0.79 to 3.21 eV
+✓ Selected 12 bands
+
+Validating band selection...
+--------------------------------------------------------------------------------
+✓ Selected bands are contiguous
+✓ Selected bands span Fermi level:
+  Bands below E_F: 4
+  Bands crossing E_F: 2
+  Bands above E_F: 6
+✓ Average distance from E_F: 2.09 eV (good)
+
+Step 9: Selecting projection orbitals...
+--------------------------------------------------------------------------------
+
+======================================================================
+Automatic Projection Orbital Selection
+======================================================================
+Selected 12 projection orbitals
+Orbital indices: [10 11 12 38 39 40 66 67 68 94 95 96]
+
+Top 5 contributing orbitals:
+  Orbital 10: weight = 0.0681
+  Orbital 94: weight = 0.0681
+  Orbital 66: weight = 0.0679
+  Orbital 38: weight = 0.0679
+  Orbital 68: weight = 0.0596
+======================================================================
+
+Step 10: Writing data files using bismuth.nnkp neighbors...
+--------------------------------------------------------------------------------
+
+======================================================================
+Writing Wannier90 Files
+======================================================================
+Using 12 selected bands: 40-51
+
+✓ Using 12 selected projection orbitals
+
+✓ Reading neighbor list from bismuth.nnkp
+  Using 8 neighbors per k-point from Wannier90
+  ✓ bismuth.eig: 2700 eigenvalues (relative to E_F = -3.727962 eV)
+  ✓ bismuth.amn: 32400 matrix elements
+  ✓ bismuth.mmn: 259200 matrix elements
+======================================================================
+
+================================================================================
+STAGE 2 COMPLETE!
+================================================================================
+✓ Created: bismuth.eig
+✓ Created: bismuth.amn
+✓ Created: bismuth.mmn
+
+All files generated with correct neighbor structure from .nnkp!
+
+NEXT STEP:
+  Run Wannier90 to generate maximally localized Wannier functions:
+  → wannier90.x bismuth
+
+================================================================================
+
+=== Ready for Final Wannier90 Run ===
+
+Files regenerated with correct band selection:
+-rw-r--r--@ 1 williamcomaskey  staff   1.7M Jan 10 01:18 bismuth.amn
+-rw-r--r--@ 1 williamcomaskey  staff    82K Jan 10 01:18 bismuth.eig
+-rw-r--r--@ 1 williamcomaskey  staff   9.4M Jan 10 01:18 bismuth.mmn
+
+Next step: Run Wannier90 to get well-localized Wannier functions
+Command: wannier90.x bismuth
+
+Expected result: Much better localization (Omega_OD < 100 Ang²)

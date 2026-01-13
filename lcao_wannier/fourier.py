@@ -143,14 +143,14 @@ def compute_phase_factors(
 ) -> np.ndarray:
     """
     Pre-compute phase factors for all k-points and R vectors.
-    
+
     Parameters
     ----------
     k_points : ndarray of shape (num_kpoints, 3)
         k-points in fractional coordinates
     R_vectors : list of tuples
         List of (R1, R2, R3) tuples
-    
+
     Returns
     -------
     phase_factors : ndarray of shape (num_kpoints, num_R_vectors)
@@ -159,11 +159,13 @@ def compute_phase_factors(
     num_kpoints = len(k_points)
     num_R = len(R_vectors)
     phase_factors = np.zeros((num_kpoints, num_R), dtype=np.complex128)
-    
+
     for k_idx, k_point in enumerate(k_points):
         for R_idx, R_tuple in enumerate(R_vectors):
             R = np.array(R_tuple)
             # Using π convention for Crystal23 compatibility
             phase_factors[k_idx, R_idx] = np.exp(1j * np.pi * np.dot(k_point, R))
-    
+
     return phase_factors
+
+

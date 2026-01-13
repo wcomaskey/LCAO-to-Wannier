@@ -1,0 +1,13 @@
+================================================================================
+STAGE 2: Creating Wannier90 Data Files (.eig, .amn, .mmn)
+================================================================================
+Input file: tests/Bismuth_basis_40.out
+Seedname: bismuth_restored
+
+ERROR: bismuth_restored.nnkp not found!
+
+You must run Stage 1 first, then run Wannier90 preprocessing:
+  1. python lcao_to_wannier90.py --stage 1 --input tests/Bismuth_basis_40.out --seedname bismuth_restored
+  2. wannier90.x -pp bismuth_restored
+  3. python lcao_to_wannier90.py --stage 2 --input tests/Bismuth_basis_40.out --seedname bismuth_restored
+

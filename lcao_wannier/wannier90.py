@@ -8,6 +8,108 @@ This module contains functions for writing Wannier90 input files
 import numpy as np
 from typing import List, Dict, Tuple, Any
 
+from .fourier import fourier_transform_to_kspace
+
+
+def compute_mmn_matrix(
+    k_idx: int,
+    next_k_idx: int,
+    kpoints: np.ndarray,
+    b_vector_cart: np.ndarray,
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    lattice_vectors: np.ndarray,
+    atom_positions: np.ndarray,
+    basis_atom_map: np.ndarray,
+    eigenvectors: List[np.ndarray]
+) -> np.ndarray:
+    """
+    Compute M_mn matrix using the Symmetric Midpoint Approximation.
+
+    This implements the correct MMN matrix calculation for LCAO methods,
+    accounting for periodic boundary conditions via the physical b-vector.
+
+    The symmetric midpoint method evaluates the overlap matrix S at the
+    midpoint between k and k+b, then applies a symmetric Berry phase
+    correction based on the average atomic positions.
+
+    Parameters
+    ----------
+    k_idx : int
+        Index of the current k-point
+    next_k_idx : int
+        Index of the neighbor k-point
+    kpoints : ndarray of shape (num_kpoints, 3)
+        K-points in fractional coordinates
+    b_vector_cart : ndarray of shape (3,)
+        Cartesian b-vector connecting k to k+b (in Angstrom)
+    real_space_matrices : dict
+        Dict mapping (n1,n2,n3) -> {'H': H_matrix, 'S': S_matrix}
+    lattice_vectors : ndarray of shape (3, 3)
+        Real-space lattice vectors (rows are [a1, a2, a3])
+    atom_positions : ndarray of shape (num_atoms, 3)
+        Atomic positions in Cartesian coordinates
+    basis_atom_map : ndarray of shape (num_orbitals,)
+        Maps each orbital to its atom index
+    eigenvectors : list of ndarray
+        Eigenvector matrices C(k), shape (num_orbitals, num_bands)
+
+    Returns
+    -------
+    M_mn : ndarray
+        MMN overlap matrix, shape (num_bands, num_bands)
+
+    Notes
+    -----
+    The symmetric midpoint method:
+    1. Computes k_mid = k + 0.5 * b_frac (using b-vector, not averaging k-points)
+    2. Evaluates S(k_mid) via Fourier transform
+    3. Applies symmetric Berry phase: exp[-i * b · (τ_i + τ_j) / 2]
+    4. Projects onto eigenvectors: M = C†(k) @ S_cross @ C(k+b)
+
+    This correctly handles periodic boundary crossings where k+b may wrap
+    around the Brillouin zone.
+    """
+    # 1. Get current k-point in fractional coordinates
+    k_curr = kpoints[k_idx]
+
+    # 2. Midpoint Strategy (Corrected for PBC)
+    # Convert Cartesian b_vector to fractional coordinates
+    # lattice_vectors rows are [a1, a2, a3], need inverse of transpose
+    inv_lattice = np.linalg.inv(lattice_vectors.T)
+    b_frac = np.dot(inv_lattice, b_vector_cart)
+
+    # k_mid is exactly half a b-step away from k_curr
+    k_mid = k_curr + 0.5 * b_frac
+
+    # 3. Get S(k_mid) using Fourier transform
+    _, S_mid = fourier_transform_to_kspace(k_mid, real_space_matrices, lattice_vectors)
+
+    # 4. Symmetric Berry Phase Correction
+    # Formula: exp[-i * b · (τ_i + τ_j) / 2]
+
+    # Get atom positions for each orbital (num_orbitals, 3)
+    taus = atom_positions[basis_atom_map]
+
+    # Calculate average position pairs: (τ_i + τ_j) / 2
+    # Broadcasting: (N, 1, 3) + (1, N, 3) -> (N, N, 3)
+    tau_mid = (taus[:, None, :] + taus[None, :, :]) / 2.0
+
+    # Calculate phase exponent: b_vec · tau_mid
+    # Sum over Cartesian components (axis 2)
+    phase_exponent = np.sum(tau_mid * b_vector_cart, axis=2)
+    phase_matrix = np.exp(-1j * phase_exponent)
+
+    # 5. Apply phase correction element-wise to get cross-overlap
+    S_cross = S_mid * phase_matrix
+
+    # 6. Project onto eigenvectors
+    C_k = eigenvectors[k_idx]
+    C_next = eigenvectors[next_k_idx]
+
+    M_mn = C_k.conj().T @ S_cross @ C_next
+
+    return M_mn
+
 
 def write_eig_file(
     filename: str,
@@ -192,23 +294,28 @@ def write_amn_file(
 def write_mmn_file_lcao(
     filename: str,
     eigenvectors_list: List[np.ndarray],
-    S_k_list: List[np.ndarray],
+    kpoints: np.ndarray,
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    lattice_vectors: np.ndarray,
     neighbor_list: Dict[int, List[Dict[str, Any]]],
     atom_positions: np.ndarray,
     basis_atom_map: np.ndarray,
     num_kpoints: int,
-    num_wann: int
+    num_wann: int,
+    convention: str = 'pi'
 ) -> None:
     """
-    Write the .mmn file for LCAO methods with atomic center phase correction.
+    Write the .mmn file for LCAO methods using the Symmetric Midpoint Method.
 
-    Implements the corrected formula:
-        M_mn(k,b) = C†_m(k) @ S_phase(k+b) @ C_n(k+b)
+    This implements the correct MMN matrix calculation using the symmetric
+    midpoint approximation, which properly handles periodic boundary conditions
+    by using the physical b-vector rather than averaging k-point coordinates.
 
-    where S_phase is the phase-shifted overlap matrix:
-        S_phase_μν(k+b) = S_μν(k+b) * exp(-i * b · τ_μ)
-
-    This accounts for the cell-periodic parts u(k) instead of Bloch states ψ(k).
+    The method:
+        1. Computes k_mid = k + 0.5 * b_frac (using b-vector for PBC)
+        2. Evaluates S(k_mid) via Fourier transform
+        3. Applies symmetric Berry phase: exp[-i * b · (τ_i + τ_j) / 2]
+        4. Projects onto eigenvectors: M = C†(k) @ S_cross @ C(k+b)
 
     Parameters
     ----------
@@ -216,64 +323,49 @@ def write_mmn_file_lcao(
         Output .mmn filename
     eigenvectors_list : list of ndarray
         Eigenvector matrices C(k), shape (num_orbitals, num_bands)
-    S_k_list : list of ndarray
-        Overlap matrices S(k), shape (num_orbitals, num_orbitals)
+    kpoints : ndarray
+        K-points in fractional coordinates, shape (num_kpoints, 3)
+    real_space_matrices : dict
+        Dict mapping (n1,n2,n3) -> {'H': H_matrix, 'S': S_matrix}
+    lattice_vectors : ndarray
+        Real-space lattice vectors, shape (3, 3)
     neighbor_list : dict
         Maps k_idx -> list of neighbor dicts with keys:
             'id': neighbor k-point index
             'G_shift': integer lattice vector (n1, n2, n3)
             'b_vec_cart': Cartesian b-vector in Angstrom
     atom_positions : ndarray
-        Atomic positions in Cartesian Angstrom, shape (num_atoms, 3)
+        Atomic positions in Cartesian coordinates, shape (num_atoms, 3)
     basis_atom_map : ndarray
-        Maps basis function index to atom index, shape (num_basis,)
+        Maps each orbital to its atom index, shape (num_orbitals,)
     num_kpoints : int
         Number of k-points
     num_wann : int
         Number of Wannier functions (selected bands)
+    convention : str, optional
+        'pi' for π convention (Crystal23), '2pi' for 2π convention
+        Default is 'pi' (unused in symmetric midpoint method)
     """
     with open(filename, 'w') as f:
         # Write header
-        f.write("Created by LCAO-to-Wannier90 (Phase-Corrected)\n")
+        f.write("Created by LCAO-to-Wannier90 (Symmetric Midpoint Method)\n")
         num_neighbors = len(neighbor_list[0])
         f.write(f"{num_wann:5d} {num_kpoints:5d} {num_neighbors:5d}\n")
 
         # Process each k-point
         for k_idx in range(num_kpoints):
-            C_k = eigenvectors_list[k_idx]  # Shape: (num_orbitals, num_wann)
-
             # Process each neighbor
             for neighbor in neighbor_list[k_idx]:
                 k_next_idx = neighbor['id']
                 G_shift = neighbor['G_shift']
                 b_vec_cart = neighbor['b_vec_cart']  # Cartesian b-vector
 
-                C_next = eigenvectors_list[k_next_idx]
-                S_next = S_k_list[k_next_idx]  # Shape: (num_orbitals, num_orbitals)
-
-                # --- SPECIAL HANDLING FOR DEGENERATE K-POINTS ---
-                # When k+b wraps to the same k-point (e.g., z-direction in 2D with nz=1),
-                # we should NOT apply phase correction as it's spurious.
-                # The overlap should simply be the identity matrix for eigenvectors.
-                if k_next_idx == k_idx:
-                    # Degenerate case: k+b = k (after wrapping)
-                    # Use unprojected overlap (should be ~identity for orthonormal eigenvectors)
-                    # For LCAO, C†(k) S(k) C(k) should give identity if C diagonalizes S^-1 F
-                    M_kb = C_k.conj().T @ S_next @ C_next  # Shape: (num_wann, num_wann)
-                else:
-                    # Normal case: k+b ≠ k
-                    # Apply atomic center phase correction
-                    # Compute phase factors: exp(-i * b · τ_μ) for each basis function μ
-                    relevant_atom_pos = atom_positions[basis_atom_map]  # Shape: (num_orbitals, 3)
-                    dot_products = np.dot(relevant_atom_pos, b_vec_cart)  # Shape: (num_orbitals,)
-                    phase_factors = np.exp(-1j * dot_products)  # Shape: (num_orbitals,)
-
-                    # Apply phase to rows of S_next (multiply rows by phase)
-                    S_phase_shifted = phase_factors[:, np.newaxis] * S_next  # Broadcasting
-
-                    # --- COMPUTE OVERLAP MATRIX ---
-                    # M(k,b) = C†(k) @ S_phase(k+b) @ C(k+b)
-                    M_kb = C_k.conj().T @ S_phase_shifted @ C_next  # Shape: (num_wann, num_wann)
+                # Compute MMN matrix using symmetric midpoint method
+                M_kb = compute_mmn_matrix(
+                    k_idx, k_next_idx, kpoints, b_vec_cart,
+                    real_space_matrices, lattice_vectors,
+                    atom_positions, basis_atom_map, eigenvectors_list
+                )
 
                 # --- WRITE TO FILE ---
                 # Write neighbor identification line

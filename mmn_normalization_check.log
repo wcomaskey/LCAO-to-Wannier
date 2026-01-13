@@ -1,0 +1,47 @@
+
+======================================================================
+LCAO-to-Wannier90 Engine Initialized
+======================================================================
+Seedname: test
+K-grid: (15, 15, 1)
+Number of k-points: 225
+Number of orbitals: 112
+Number of Wannier functions: 112 (full basis)
+Number of R-vectors: 39
+======================================================================
+Solving eigenvalue problems (serial)...
+
+======================================================================
+Solving Eigenvalue Problems at 225 K-Points
+======================================================================
+Mode: Sequential
+✓ Eigenvalue problems solved successfully
+======================================================================
+✓ Solved 225 k-points
+
+Testing band selection: indices 40-55
+Number of selected bands: 16
+
+================================================================================
+CHECKING S-ORTHONORMALITY OF SELECTED EIGENVECTORS
+================================================================================
+
+K-point 0:
+  C_sel† S C_sel diagonal range: [1.0000000000, 1.0000000000]
+  Off-diagonal max: 1.15e-15
+  Max deviation from identity: 4.00e-15
+
+K-point 112:
+  C_sel† S C_sel diagonal range: [1.0000000000, 1.0000000000]
+  Off-diagonal max: 1.27e-15
+  Max deviation from identity: 1.56e-15
+
+K-point 224:
+  C_sel† S C_sel diagonal range: [1.0000000000, 1.0000000000]
+  Off-diagonal max: 1.11e-15
+  Max deviation from identity: 2.00e-15
+
+================================================================================
+If selected eigenvectors ARE S-orthonormal, the issue is elsewhere.
+If NOT, we need to re-orthonormalize after band selection.
+================================================================================

@@ -35,6 +35,7 @@ from .parser import (
     parse_overlap_and_fock_matrices,
     parse_calculation_parameters,  # NEW
     parse_atomic_basis_info,  # NEW
+    parse_orbital_types,  # NEW
     create_spin_block_matrices,
     fill_raw_matrix,
     is_hermitian,
@@ -93,6 +94,7 @@ from .wannier90 import (
     write_amn_file,
     write_mmn_file,
     write_wannier90_files,
+    compute_mmn_matrix,
 )
 
 # Win file writer
@@ -121,6 +123,15 @@ from .band_selection import (
     OrbitalSelectionResult
 )
 
+from .orbital_analysis import (
+    compute_band_projections,
+    compute_band_character,
+    identify_dominant_character,
+    analyze_all_bands_character,
+    format_band_character_table,
+    BandCharacter
+)
+
 # Public API
 __all__ = [
     # Main class
@@ -133,6 +144,7 @@ __all__ = [
     'is_hermitian',
     'parse_calculation_parameters',
     'parse_atomic_basis_info',
+    'parse_orbital_types',
     'CalculationParameters',
     'AtomicBasisInfo',
     
@@ -175,6 +187,7 @@ __all__ = [
     'write_amn_file',
     'write_mmn_file',
     'write_wannier90_files',
+    'compute_mmn_matrix',
     'write_win_file',
     'create_win_config_from_engine',
     'parse_atoms_from_crystal_output',
@@ -196,4 +209,12 @@ __all__ = [
     'suggest_optimal_window',
     'BandWindowResult',
     'OrbitalSelectionResult',
+
+    # Orbital analysis
+    'compute_band_projections',
+    'compute_band_character',
+    'identify_dominant_character',
+    'analyze_all_bands_character',
+    'format_band_character_table',
+    'BandCharacter',
 ]

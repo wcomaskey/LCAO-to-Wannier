@@ -1,0 +1,70 @@
+================================================================================
+STAGE 2: Creating Wannier90 Data Files (.eig, .amn, .mmn)
+================================================================================
+Input file: tests/Bismuth_basis_40.out
+Seedname: bismuth
+
+✓ Found bismuth.nnkp
+✓ Found bismuth.win
+
+Step 1: Parsing CRYSTAL/LCAO output file...
+--------------------------------------------------------------------------------
+✓ Parsed calculation parameters:
+  Fermi energy: -3.727962 eV
+  K-grid: (15, 15, 1)
+  Number of AOs: 56
+  Spin-orbit coupling: Yes
+  → Doubling orbitals for spinors: 56 → 112
+
+Step 2: Organizing matrices...
+--------------------------------------------------------------------------------
+✓ Organized matrices
+  Basis size: 56
+  Unique R-vectors for H: 40
+  Unique R-vectors for S: 40
+
+Step 3: Creating matrices...
+--------------------------------------------------------------------------------
+✓ Created 112×112 SOC matrices
+
+Step 4: Preparing real-space matrices...
+--------------------------------------------------------------------------------
+✓ Prepared 39 R-vectors
+
+Step 5: Reading parameters from .win file...
+--------------------------------------------------------------------------------
+  Found num_wann = 12
+  Found num_bands = 16
+✓ Read parameters from bismuth.win
+
+Step 6: Determining energy window...
+--------------------------------------------------------------------------------
+Using user-specified window: [-25.00, 10.00] eV
+
+Step 7: Initializing Wannier90 engine...
+--------------------------------------------------------------------------------
+
+======================================================================
+LCAO-to-Wannier90 Engine Initialized
+======================================================================
+Seedname: bismuth
+K-grid: (15, 15, 1)
+Number of k-points: 225
+Number of orbitals: 112
+Number of Wannier functions: 12 (user-specified)
+Number of R-vectors: 39
+Energy window: [-25.00, 10.00] eV (relative to E_F)
+Fermi energy: -3.7280 eV (user-specified)
+======================================================================
+✓ Engine initialized
+
+Parsing atomic basis information...
+✓ Parsed 2 atoms, 56 basis functions (SOC: doubled basis map)
+
+Step 7: Solving eigenvalue problems...
+--------------------------------------------------------------------------------
+
+======================================================================
+Solving Eigenvalue Problems at 225 K-Points
+======================================================================
+Mode: Parallel

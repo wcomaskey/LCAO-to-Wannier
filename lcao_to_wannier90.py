@@ -448,6 +448,8 @@ def stage2_create_data_files(args):
 
     num_wann_from_win = None
     num_bands_from_win = None
+    dis_froz_min_from_win = None
+    dis_froz_max_from_win = None
     win_file = f"{args.seedname}.win"
 
     if os.path.exists(win_file):
@@ -464,6 +466,18 @@ def stage2_create_data_files(args):
                     try:
                         num_bands_from_win = int(line.split('=')[1].strip())
                         print(f"  Found num_bands = {num_bands_from_win}")
+                    except:
+                        pass
+                elif line.startswith('dis_froz_min'):
+                    try:
+                        dis_froz_min_from_win = float(line.split('=')[1].strip())
+                        print(f"  Found dis_froz_min = {dis_froz_min_from_win}")
+                    except:
+                        pass
+                elif line.startswith('dis_froz_max'):
+                    try:
+                        dis_froz_max_from_win = float(line.split('=')[1].strip())
+                        print(f"  Found dis_froz_max = {dis_froz_max_from_win}")
                     except:
                         pass
         print(f"✓ Read parameters from {win_file}")
@@ -552,7 +566,6 @@ def stage2_create_data_files(args):
         # Use values from .win file
         print(f"Using num_wann = {num_wann_from_win} and num_bands = {num_bands_from_win} from .win file")
 
-        # Still need to analyze bands to find which bands are in the energy window
         result = analyze_band_window(
             engine.eigenvalues_list,
             outer_window=(e_min, e_max),
@@ -594,6 +607,53 @@ def stage2_create_data_files(args):
         engine.selected_band_indices = result.frozen_indices
 
         print(f"✓ Selected {num_frozen} bands for Wannier functions")
+
+    # Validate band selection
+    print("\nValidating band selection...")
+    print("-" * 80)
+
+    selected = np.array(engine.selected_band_indices)
+
+    # Check 1: Are bands contiguous?
+    gaps = np.diff(selected)
+    if np.any(gaps > 1):
+        gap_locations = np.where(gaps > 1)[0]
+        print(f"⚠ Warning: Selected bands are non-contiguous!")
+        print(f"  Gaps at band indices: {[selected[i] for i in gap_locations]}")
+    else:
+        print(f"✓ Selected bands are contiguous")
+
+    # Check 2: Do selected bands span Fermi level?
+    selected_e_min = min([result.band_ranges[i][0] for i in selected])
+    selected_e_max = max([result.band_ranges[i][1] for i in selected])
+
+    if engine.e_fermi < selected_e_min:
+        print(f"⚠ Warning: Fermi level ({engine.e_fermi:.2f} eV) is BELOW all selected bands")
+        print(f"  Selected range: [{selected_e_min:.2f}, {selected_e_max:.2f}] eV")
+        print(f"  You may have selected only conduction bands!")
+    elif engine.e_fermi > selected_e_max:
+        print(f"⚠ Warning: Fermi level ({engine.e_fermi:.2f} eV) is ABOVE all selected bands")
+        print(f"  Selected range: [{selected_e_min:.2f}, {selected_e_max:.2f}] eV")
+        print(f"  You may have selected only core/valence bands!")
+    else:
+        # Count bands below and above E_F
+        bands_below = sum(1 for i in selected if result.band_ranges[i][1] < engine.e_fermi)
+        bands_above = sum(1 for i in selected if result.band_ranges[i][0] > engine.e_fermi)
+        bands_crossing = len(selected) - bands_below - bands_above
+
+        print(f"✓ Selected bands span Fermi level:")
+        print(f"  Bands below E_F: {bands_below}")
+        print(f"  Bands crossing E_F: {bands_crossing}")
+        print(f"  Bands above E_F: {bands_above}")
+
+    # Check 3: Average distance from Fermi
+    avg_distance = np.mean([abs((result.band_ranges[i][0] + result.band_ranges[i][1])/2 - engine.e_fermi)
+                            for i in selected])
+    if avg_distance > 10.0:
+        print(f"⚠ Warning: Average distance from Fermi level is large ({avg_distance:.2f} eV)")
+        print(f"  Consider narrowing your energy window.")
+    else:
+        print(f"✓ Average distance from E_F: {avg_distance:.2f} eV (good)")
 
     # Select projection orbitals
     print(f"\nStep 9: Selecting projection orbitals...")

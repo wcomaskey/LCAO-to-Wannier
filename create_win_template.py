@@ -23,9 +23,12 @@ from lcao_wannier import (
 )
 
 
-def create_win_template(input_file, seedname, num_wann=12, num_bands=20):
+def create_win_template(input_file, seedname, num_wann=12, num_bands=None, auto_window=True):
     """
     Create a .win template file with proper SOC settings.
+
+    If auto_window=True, analyzes the band structure to determine optimal
+    energy windows and num_bands automatically.
     """
     print(f"Creating Wannier90 template for: {seedname}")
     print(f"Input: {input_file}")
@@ -44,6 +47,52 @@ def create_win_template(input_file, seedname, num_wann=12, num_bands=20):
     print(f"✓ Fermi energy: {params.fermi_energy:.6f} eV")
     print(f"✓ K-grid: {params.k_grid}")
     print(f"✓ Atoms: {len(atoms)}")
+
+    # Set energy windows based on num_wann
+    if auto_window:
+        print()
+        print("Setting optimal energy windows based on num_wann...")
+        print("-" * 80)
+
+        # Use conservative defaults optimized for bands near Fermi level
+        # These are based on typical valence/conduction band spreads
+        target_num_bands = num_bands if num_bands else num_wann + 4
+
+        # Choose window based on target num_bands
+        if target_num_bands <= 14:
+            # Narrow window for small num_bands
+            dis_win_min, dis_win_max = -10.0, 5.0
+        elif target_num_bands <= 18:
+            # Medium window
+            dis_win_min, dis_win_max = -12.0, 6.0
+        elif target_num_bands <= 24:
+            # Wide window
+            dis_win_min, dis_win_max = -15.0, 8.0
+        else:
+            # Very wide window for many bands
+            dis_win_min, dis_win_max = -20.0, 10.0
+
+        # Frozen window: always keep narrow around Fermi level
+        dis_froz_min = max(dis_win_min, -6.0)
+        dis_froz_max = min(dis_win_max, 3.0)
+        num_bands = target_num_bands
+
+        print(f"✓ Recommended configuration for num_wann={num_wann}:")
+        print(f"  Outer window: [{dis_win_min:.1f}, {dis_win_max:.1f}] eV (relative to E_F)")
+        print(f"  Frozen window: [{dis_froz_min:.1f}, {dis_froz_max:.1f}] eV (relative to E_F)")
+        print(f"  num_bands: {num_bands}")
+        print()
+        print(f"  Note: Stage 2 will select the {num_bands} bands closest to Fermi level")
+        print(f"        within this window, ensuring physically meaningful results.")
+    else:
+        # Use default/user-specified values
+        dis_win_min = -25.0
+        dis_win_max = 10.0
+        dis_froz_min = -4.5
+        dis_froz_max = 2.0
+        if num_bands is None:
+            num_bands = 16
+
     print()
 
     # Atoms are already in fractional coordinates from parse_atoms_from_crystal_output
@@ -75,12 +124,12 @@ conv_window = 5
 num_print_cycles = 10
 
 ! Disentanglement windows (eV, relative to Fermi energy)
-! Outer window: wide enough to capture 16-20 bands for disentanglement
-dis_win_min = -25.0
-dis_win_max = 10.0
-! Frozen window: bands near Fermi level (-4.25 to 1.51 eV range)
-dis_froz_min = -4.5
-dis_froz_max = 2.0
+! Outer window: optimized to capture bands near Fermi level
+dis_win_min = {dis_win_min:.1f}
+dis_win_max = {dis_win_max:.1f}
+! Frozen window: bands closest to Fermi level
+dis_froz_min = {dis_froz_min:.1f}
+dis_froz_max = {dis_froz_max:.1f}
 dis_num_iter = 1000
 dis_mix_ratio = 0.5
 
@@ -179,12 +228,15 @@ end projections
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Create Wannier90 .win template file'
+        description='Create Wannier90 .win template file with automatic band analysis'
     )
     parser.add_argument('--input', required=True, help='CRYSTAL output file')
     parser.add_argument('--seedname', required=True, help='Wannier90 seedname')
     parser.add_argument('--num-wann', type=int, default=12, help='Number of Wannier functions (default: 12)')
-    parser.add_argument('--num-bands', type=int, default=16, help='Number of bands (default: 16)')
+    parser.add_argument('--num-bands', type=int, default=None,
+                       help='Number of bands (default: auto-detect as num_wann + 4)')
+    parser.add_argument('--no-auto-window', action='store_true',
+                       help='Disable automatic window analysis (use default windows)')
 
     args = parser.parse_args()
 
@@ -192,7 +244,8 @@ def main():
         print(f"Error: Input file not found: {args.input}")
         sys.exit(1)
 
-    create_win_template(args.input, args.seedname, args.num_wann, args.num_bands)
+    create_win_template(args.input, args.seedname, args.num_wann, args.num_bands,
+                       auto_window=not args.no_auto_window)
 
 
 if __name__ == '__main__':
