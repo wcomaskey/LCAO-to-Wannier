@@ -101,10 +101,11 @@ def test_eigenvalue_solving():
         eigs = engine.eigenvalues_list[k_idx]
         evecs = engine.eigenvectors_list[k_idx]
         
-        assert len(eigs) == engine.num_wann, \
-            f"Expected {engine.num_wann} eigenvalues, got {len(eigs)}"
-        assert evecs.shape == (4, engine.num_wann), \
-            f"Expected eigenvectors shape (4, {engine.num_wann}), got {evecs.shape}"
+        # Engine solves full eigenvalue problem (all orbitals), not just num_wann
+        assert len(eigs) == engine.num_orbitals, \
+            f"Expected {engine.num_orbitals} eigenvalues, got {len(eigs)}"
+        assert evecs.shape == (engine.num_orbitals, engine.num_orbitals), \
+            f"Expected eigenvectors shape ({engine.num_orbitals}, {engine.num_orbitals}), got {evecs.shape}"
         
         # Check that eigenvalues are real
         assert np.all(np.isreal(eigs)), f"Eigenvalues not real at k-point {k_idx}"
@@ -301,8 +302,8 @@ def test_parallel_vs_sequential_alternative():
     
     for k_idx in range(engine_seq.num_kpoints):
         # 1. Check eigenvalues
-        eigs_seq = engine_seq.eigenvalues[k_idx]
-        eigs_par = engine_par.eigenvalues[k_idx]
+        eigs_seq = engine_seq.eigenvalues_list[k_idx]
+        eigs_par = engine_par.eigenvalues_list[k_idx]
         
         eig_diff = np.max(np.abs(eigs_seq - eigs_par))
         max_eig_diff = max(max_eig_diff, eig_diff)
@@ -311,8 +312,8 @@ def test_parallel_vs_sequential_alternative():
             f"Eigenvalue difference at k-point {k_idx}: {eig_diff}"
         
         # 2. Check eigenvectors (accounting for phase ambiguity)
-        evecs_seq = engine_seq.eigenvectors[k_idx]
-        evecs_par = engine_par.eigenvectors[k_idx]
+        evecs_seq = engine_seq.eigenvectors_list[k_idx]
+        evecs_par = engine_par.eigenvectors_list[k_idx]
         
         # For each eigenvector, check that |<seq|par>| ≈ 1
         # (they should be identical up to a phase factor)

@@ -183,8 +183,9 @@ def test_complete_workflow():
     
     # Check verification results
     assert results is not None, "No verification results!"
-    assert 'hermiticity' in results, "Missing hermiticity check!"
-    assert 'orthonormality' in results, "Missing orthonormality check!"
+    assert 'verification' in results, "Missing verification results!"
+    assert 'hermiticity' in results['verification'], "Missing hermiticity check!"
+    assert 'orthonormality' in results['verification'], "Missing orthonormality check!"
     
     print(f"  ✓ All files created")
     print(f"  ✓ Verification checks passed")

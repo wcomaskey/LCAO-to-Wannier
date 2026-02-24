@@ -114,6 +114,7 @@ class Wannier90WinConfig:
 
     # System properties
     spinors: bool = False
+    fermi_energy: Optional[float] = None
     use_bloch_phases: bool = False
 
     # Band structure path (optional)
@@ -231,6 +232,11 @@ def write_win_file(
         lines.append("spinors = .true.")
         lines.append("")
 
+    if config.fermi_energy is not None:
+        lines.append(f"! Fermi energy (for relative energy windows)")
+        lines.append(f"fermi_energy = {config.fermi_energy:.6f}")
+        lines.append("")
+
     if config.use_bloch_phases:
         lines.append("! Use Bloch-like phases (for LCAO inputs)")
         lines.append("use_bloch_phases = .true.")
@@ -336,8 +342,8 @@ def write_win_file(
         lines.append("!====================")
         lines.append("! BAND STRUCTURE PATH")
         lines.append("!====================")
-        lines.append("restart = plot")
-        lines.append("bands_plot = T")
+        lines.append("! Note: add 'restart = plot' after initial wannierization")
+        lines.append("! to generate band structure interpolation")
         lines.append("bands_num_points = 100")
         lines.append("")
         lines.append("begin kpoint_path")
@@ -385,6 +391,7 @@ def create_win_config_from_engine(
     bands_plot: bool = False,
     kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None,
     use_bloch_phases: bool = False,
+    num_iter: Optional[int] = None,
     **kwargs
 ) -> Wannier90WinConfig:
     """
@@ -414,6 +421,9 @@ def create_win_config_from_engine(
         High-symmetry path for band plotting as [(label, coords), ...]
     use_bloch_phases : bool, optional
         Use Bloch-like phases (recommended for LCAO, default: False)
+    num_iter : int, optional
+        Override num_iter in the .win file. If None, uses default (500).
+        Set to 0 for direct LCAO mapping (skip spread minimization).
     **kwargs
         Additional keyword arguments passed to Wannier90WinConfig
 
@@ -447,16 +457,18 @@ def create_win_config_from_engine(
         )
 
     # Determine num_wann and num_bands
+    num_wann = engine.num_wann
+
     if hasattr(engine, 'selected_band_indices') and engine.selected_band_indices is not None:
-        num_wann = len(engine.selected_band_indices)
         band_indices = engine.selected_band_indices
     else:
-        num_wann = engine.num_wann
         band_indices = np.arange(num_wann)
 
-    # For LCAO method, num_bands typically equals num_wann
-    # since we pre-select bands (no disentanglement needed)
-    num_bands = num_wann
+    # Check if engine has disentanglement info from smart selector
+    if hasattr(engine, '_num_bands_for_win') and engine._num_bands_for_win is not None:
+        num_bands = engine._num_bands_for_win
+    else:
+        num_bands = num_wann
 
     # Determine energy windows (only if disentanglement is needed)
     dis_win_min = None
@@ -464,11 +476,11 @@ def create_win_config_from_engine(
     dis_froz_min = None
     dis_froz_max = None
 
-    # If band analysis was performed, we can extract window info
-    if hasattr(engine, 'band_analysis') and engine.band_analysis is not None:
-        # LCAO approach: bands are pre-selected, so num_bands = num_wann
-        # No disentanglement windows needed
-        pass
+    # Use disentanglement windows from smart selector if available
+    if hasattr(engine, '_dis_win') and engine._dis_win is not None:
+        dis_win_min, dis_win_max = engine._dis_win
+    if hasattr(engine, '_dis_froz') and engine._dis_froz is not None:
+        dis_froz_min, dis_froz_max = engine._dis_froz
 
     # Override defaults with any provided kwargs
     config_params = {
@@ -480,6 +492,7 @@ def create_win_config_from_engine(
         'atoms': atoms,
         'projections': projections,
         'spinors': spinors,
+        'fermi_energy': getattr(engine, 'e_fermi', None),
         'write_hr': write_hr,
         'bands_plot': bands_plot,
         'kpoint_path': kpoint_path,
@@ -489,6 +502,10 @@ def create_win_config_from_engine(
         'dis_froz_min': dis_froz_min,
         'dis_froz_max': dis_froz_max,
     }
+
+    # Override num_iter if specified (e.g., 0 for direct method)
+    if num_iter is not None:
+        config_params['num_iter'] = num_iter
 
     # Update with user-provided kwargs
     config_params.update(kwargs)

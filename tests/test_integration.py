@@ -297,20 +297,22 @@ def test_complete_workflow_parallel():
         
         # Verify results
         assert results is not None, "No results returned"
-        assert 'hermiticity' in results, "Hermiticity check missing"
-        assert 'orthonormality' in results, "Orthonormality check missing"
+        assert 'verification' in results, "Verification results missing"
+        assert 'hermiticity' in results['verification'], "Hermiticity check missing"
+        assert 'orthonormality' in results['verification'], "Orthonormality check missing"
         
         # Check numerical accuracy
         # Handle both scalar and dictionary results
-        if isinstance(results['hermiticity'], dict):
-            hermiticity_error = max(results['hermiticity'].values())
+        verification = results['verification']
+        if isinstance(verification['hermiticity'], dict):
+            hermiticity_error = max(verification['hermiticity'].values())
         else:
-            hermiticity_error = results['hermiticity']
-            
-        if isinstance(results['orthonormality'], dict):
-            orthonormality_error = results['orthonormality']['max_deviation']
+            hermiticity_error = verification['hermiticity']
+
+        if isinstance(verification['orthonormality'], dict):
+            orthonormality_error = verification['orthonormality']['max_deviation']
         else:
-            orthonormality_error = results['orthonormality']
+            orthonormality_error = verification['orthonormality']
         
         # Relaxed tolerance for randomly generated test matrices
         assert hermiticity_error < 1.0, \
@@ -327,12 +329,12 @@ def test_complete_workflow_parallel():
         print(f"\n✓ Parallel execution successful")
         
         # Print results based on structure
-        if isinstance(results['hermiticity'], dict):
+        if isinstance(verification['hermiticity'], dict):
             print(f"  Hermiticity: H={hermiticity_error:.2e}")
         else:
             print(f"  Hermiticity: {hermiticity_error:.2e}")
-            
-        if isinstance(results['orthonormality'], dict):
+
+        if isinstance(verification['orthonormality'], dict):
             print(f"  Orthonormality: {orthonormality_error:.2e}")
         else:
             print(f"  Orthonormality: {orthonormality_error:.2e}")

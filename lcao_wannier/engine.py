@@ -208,6 +208,14 @@ class Wannier90Engine:
         self.atom_positions = None
         self.basis_atom_map = None
 
+        # Override for num_iter (used by direct method to skip minimization)
+        self._override_num_iter = None
+
+        # Disentanglement parameters (set by smart band selector)
+        self._num_bands_for_win = None   # num_bands for .win (may differ from num_wann)
+        self._dis_win = None             # (dis_win_min, dis_win_max) relative to E_F
+        self._dis_froz = None            # (dis_froz_min, dis_froz_max) relative to E_F
+
         # Print initialization info
         self._print_init_info()
     
@@ -666,15 +674,22 @@ class Wannier90Engine:
 
         # Shift eigenvalues to be relative to Fermi energy for Wannier90
         # (when fermi_energy is specified in .win, Wannier90 expects relative energies)
-        eigenvalues_relative = []
-        for eigs in eigenvalues_selected:
-            eigenvalues_relative.append(eigs - self.e_fermi)
+        if self.e_fermi is not None:
+            eigenvalues_relative = []
+            for eigs in eigenvalues_selected:
+                eigenvalues_relative.append(eigs - self.e_fermi)
+        else:
+            # No Fermi energy set — use absolute eigenvalues
+            eigenvalues_relative = eigenvalues_selected
 
         eig_file = f"{self.seedname}.eig"
         write_eig_file(eig_file, eigenvalues_relative, self.num_kpoints, len(band_indices))
         if verbose:
             num_entries = self.num_kpoints * len(band_indices)
-            print(f"  ✓ {eig_file}: {num_entries} eigenvalues (relative to E_F = {self.e_fermi:.6f} eV)")
+            if self.e_fermi is not None:
+                print(f"  ✓ {eig_file}: {num_entries} eigenvalues (relative to E_F = {self.e_fermi:.6f} eV)")
+            else:
+                print(f"  ✓ {eig_file}: {num_entries} eigenvalues (absolute energies, no E_F set)")
 
         # DISABLED: Auto-update feature commented out to allow num_bands > actual bands in window
         # This is needed for disentanglement where num_bands should be > num_wann
@@ -744,6 +759,11 @@ class Wannier90Engine:
                     neighbor_list_to_use,
                     self.recip_lattice
                 )
+            
+            if verbose:
+                print(f"  DEBUG: eigenvectors_selected[0].shape = {eigenvectors_selected[0].shape}")
+                print(f"  DEBUG: len(band_indices) = {len(band_indices)}")
+                print(f"  DEBUG: band_indices = {band_indices}")
 
             write_mmn_file_lcao(
                 mmn_file,
@@ -756,7 +776,9 @@ class Wannier90Engine:
                 self.basis_atom_map,
                 self.num_kpoints,
                 len(band_indices),
-                convention='pi'
+                convention='pi',
+                use_direct_method=True,  # Use new direct real-space method
+                verbose=verbose
             )
         else:
             # Fallback to standard MMN writer (no phase correction)
@@ -779,7 +801,8 @@ class Wannier90Engine:
                 bands_plot=bands_plot,
                 kpoint_path=kpoint_path,
                 write_hr=True,
-                use_bloch_phases=False
+                use_bloch_phases=False,
+                num_iter=self._override_num_iter,
             )
             write_win_file(self.seedname, win_config, verbose=verbose)
 

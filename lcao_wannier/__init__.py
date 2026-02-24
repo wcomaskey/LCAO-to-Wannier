@@ -132,6 +132,14 @@ from .orbital_analysis import (
     BandCharacter
 )
 
+from .projectability import (
+    compute_band_projectability,
+    select_bands_by_projectability,
+    smart_select_bands,
+    ProjectabilityResult,
+    SmartSelectionResult,
+)
+
 # Public API
 __all__ = [
     # Main class
@@ -217,4 +225,11 @@ __all__ = [
     'analyze_all_bands_character',
     'format_band_character_table',
     'BandCharacter',
+
+    # Projectability
+    'compute_band_projectability',
+    'select_bands_by_projectability',
+    'smart_select_bands',
+    'ProjectabilityResult',
+    'SmartSelectionResult',
 ]

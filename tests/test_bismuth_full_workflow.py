@@ -219,7 +219,7 @@ def test_bismuth_workflow(
 
     # Determine num_wann based on mode
     if mode == 'full':
-        num_wann = H_full_list[0].shape[0]
+        num_wann = H_full_list[0][1].shape[0]  # (R_cart, H_matrix) tuple
         outer_window = None
         num_electrons = None
     elif mode == 'window':
