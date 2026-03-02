@@ -21,8 +21,16 @@ overlap_header_pattern = re.compile(
 fock_header_pattern = re.compile(
     r'^\s*FOCK MATRIX \((REAL|IMAG) PART\) - CELL N\.\s+\d+\(\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\)'
 )
+# Simple Fock matrix header (no REAL/IMAG split, used in some CRYSTAL formats)
+fock_simple_header_pattern = re.compile(
+    r'^\s*FOCK MATRIX - CELL N\.\s+\d+\(\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*\)'
+)
 spin_channel_pattern = re.compile(
     r'^\s*(ALPHA_ALPHA|ALPHA_BETA|BETA_ALPHA|BETA_BETA) ELECTRONS', re.IGNORECASE
+)
+# Simple spin channel header (ALPHA/BETA without compound labels)
+spin_simple_pattern = re.compile(
+    r'^\s*(ALPHA|BETA)\s+ELECTRONS', re.IGNORECASE
 )
 column_indices_pattern = re.compile(r'^\s*(\d+\s+)+\d+\s*$')
 data_line_pattern = re.compile(r'^\s*(\d+)\s+(.+)$')
@@ -275,7 +283,9 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
                 # Check if this looks like an atom line (symbol is all letters)
                 if parts[1].isalpha() and parts[1].isupper():
                     atom_idx = atom_idx_test - 1  # Convert to 0-based
-                    symbol = parts[1]
+                    # Normalize symbol: CRYSTAL uses ALL-CAPS (TE, SN, BI)
+                    # Convert to standard form (Te, Sn, Bi)
+                    symbol = parts[1].capitalize()
                     x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
 
                     atom_positions_bohr.append([x, y, z])
@@ -312,21 +322,28 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
     atom_positions = np.array(atom_positions_bohr) * BOHR_TO_ANGSTROM
 
     # Determine total number of basis functions
-    if basis_ranges:
-        # Number of basis functions explicitly listed for first atom
-        num_basis_per_atom = max(end for _, start, end in basis_ranges) + 1
-        # Total basis functions = num_basis_per_atom * num_atoms
+    if not basis_ranges:
+        raise ValueError("Could not determine number of basis functions from BASIS SET")
+
+    # Check which atoms have explicit basis function listings
+    atoms_with_basis = set(atom_idx for atom_idx, _, _ in basis_ranges)
+    max_basis_index = max(end for _, _, end in basis_ranges)
+
+    if len(atoms_with_basis) == 1 and len(atom_symbols) > 1:
+        # Only one atom has explicit orbitals (homoatomic, e.g. Bi2)
+        # Assume symmetric: replicate for all atoms
+        num_basis_per_atom = max_basis_index + 1
         num_basis = num_basis_per_atom * len(atom_symbols)
     else:
-        # Fallback: try to infer from OVERLAP MATRIX
-        raise ValueError("Could not determine number of basis functions from BASIS SET")
+        # All atoms have explicit orbitals with global indexing (heteroatomic, e.g. SnTe)
+        num_basis = max_basis_index + 1
 
     # Create basis-to-atom mapping
     basis_atom_map = np.zeros(num_basis, dtype=int)
 
-    # If only first atom has explicit basis ranges, assume symmetry
-    if basis_ranges and all(atom_idx == 0 for atom_idx, _, _ in basis_ranges):
+    if len(atoms_with_basis) == 1 and len(atom_symbols) > 1:
         # Fill in symmetrically for all atoms
+        num_basis_per_atom = max_basis_index + 1
         for atom_idx in range(len(atom_symbols)):
             start_basis = atom_idx * num_basis_per_atom
             end_basis = (atom_idx + 1) * num_basis_per_atom
@@ -427,26 +444,35 @@ def parse_orbital_types(lines: List[str], has_soc: bool = False, num_atoms: Opti
     if not orbital_types:
         return {}
 
-    # Replicate orbital types for all atoms
-    # The BASIS SET section typically lists one atom's orbitals
-    # We need to replicate this pattern for each atom
-    orbitals_per_atom = max(orbital_types.keys())
+    max_idx = max(orbital_types.keys())
 
     # Auto-detect number of atoms if not provided
     if num_atoms is None:
-        # Try to parse from atomic basis info
         try:
             atomic_info = parse_atomic_basis_info(lines)
             num_atoms = atomic_info.num_atoms
         except:
-            num_atoms = 1  # Default to 1 atom if parsing fails
+            num_atoms = 1
 
-    # Replicate for all atoms
-    all_orbital_types = {}
-    for atom_idx in range(num_atoms):
-        offset = atom_idx * orbitals_per_atom
-        for orb_idx, orb_type in orbital_types.items():
-            all_orbital_types[orb_idx + offset] = orb_type
+    # Determine if the file already lists orbitals for ALL atoms (heteroatomic)
+    # or only the first atom (homoatomic, needs replication)
+    try:
+        atomic_info = parse_atomic_basis_info(lines)
+        total_basis = atomic_info.num_basis
+    except:
+        total_basis = None
+
+    if total_basis is not None and max_idx == total_basis:
+        # All atoms' orbitals already listed with global indices (e.g. SnTe: 1-71)
+        all_orbital_types = dict(orbital_types)
+    else:
+        # Only first atom listed (e.g. Bi2: 1-28) → replicate for all atoms
+        orbitals_per_atom = max_idx
+        all_orbital_types = {}
+        for atom_idx in range(num_atoms):
+            offset = atom_idx * orbitals_per_atom
+            for orb_idx, orb_type in orbital_types.items():
+                all_orbital_types[orb_idx + offset] = orb_type
 
     # For SOC systems, double the mapping (each spatial orbital → 2 spinor components)
     if has_soc:
@@ -536,7 +562,9 @@ def parse_matrix_data(lines: List[str], start_index: int) -> Dict:
         
         if (overlap_header_pattern.match(line) or
             fock_header_pattern.match(line) or
+            fock_simple_header_pattern.match(line) or
             spin_channel_pattern.match(line) or
+            spin_simple_pattern.match(line) or
             direct_lattice_header_pattern.match(line)):
             break
         elif line_stripped == '':
@@ -606,12 +634,23 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
             if len(vectors) == 3:
                 direct_lattice_vectors = vectors
         
-        # Parse spin channel header
+        # Parse spin channel header (compound: ALPHA_ALPHA, ALPHA_BETA, etc.)
         elif spin_channel_pattern.match(line):
             spin_match = spin_channel_pattern.match(line)
             current_spin_channel = spin_match.group(1).upper()
             i += 1
-        
+
+        # Parse simple spin channel header (ALPHA/BETA ELECTRONS)
+        elif spin_simple_pattern.match(line):
+            spin_match = spin_simple_pattern.match(line)
+            simple_label = spin_match.group(1).upper()
+            # Map simple labels to compound labels for spin-block assembly
+            if simple_label == 'ALPHA':
+                current_spin_channel = 'ALPHA_ALPHA'
+            elif simple_label == 'BETA':
+                current_spin_channel = 'BETA_BETA'
+            i += 1
+
         # Parse overlap matrix
         elif overlap_header_pattern.match(line):
             header_match = overlap_header_pattern.match(line)
@@ -627,8 +666,8 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
                 'data': S_parsed['matrix'],
             })
             i = S_parsed['next_index']
-        
-        # Parse Fock matrix
+
+        # Parse Fock matrix with REAL/IMAG parts (complex SOC format)
         elif fock_header_pattern.match(line):
             header_match = fock_header_pattern.match(line)
             part = header_match.group(1).lower()
@@ -640,6 +679,19 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
             if key not in fock_temp_storage:
                 fock_temp_storage[key] = {}
             fock_temp_storage[key][part] = F_parsed['matrix']
+            i = F_parsed['next_index']
+
+        # Parse simple Fock matrix (real-valued, no REAL/IMAG split)
+        elif fock_simple_header_pattern.match(line):
+            header_match = fock_simple_header_pattern.match(line)
+            lattice_vector = tuple(int(header_match.group(j)) for j in range(1, 4))
+            i += 1
+            F_parsed = parse_matrix_data(lines, i)
+            key = (current_spin_channel, lattice_vector)
+            if key not in fock_temp_storage:
+                fock_temp_storage[key] = {}
+            # Store as real part only (no imaginary component)
+            fock_temp_storage[key]['real'] = F_parsed['matrix']
             i = F_parsed['next_index']
         else:
             i += 1

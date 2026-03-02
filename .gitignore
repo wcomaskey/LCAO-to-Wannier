@@ -24,12 +24,14 @@ wheels/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # Testing
 .pytest_cache/
@@ -40,16 +42,43 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Test output files
-tests/*.amn
-tests/*.mmn
-tests/*.eig
-
-# Example output files
-examples/*.amn
-examples/*.mmn
-examples/*.eig
-
+# Wannier90 input/output files
 *.amn
 *.mmn
 *.eig
+*.chk
+*.wout
+*.werr
+*.wpout
+*.nnkp
+*.win
+*.spn
+*.uHu
+
+# Wannier90 generated data files
+*_band.dat
+*_band.gnu
+*_band.kpt
+*_band.labelinfo.dat
+*_hr.dat
+*_wsvec.dat
+*_centres.xyz
+
+# Generated plots
+*.pdf
+
+# Internal documentation/notes (not user-facing)
+BAND_SELECTION_METHODOLOGY.md
+SUCCESS_COMPLETE.md
+WANNIER90_MACOS_SEGFAULT.md
+
+# Development test scripts (not part of formal test suite)
+# The formal test suite in tests/ is tracked
+test_*.py
+!tests/test_*.py
+
+# External dependencies (wannier90 builds, etc.)
+external/
+
+# Jupyter
+.ipynb_checkpoints/

@@ -117,6 +117,7 @@ from .band_selection import (
     check_frozen_continuity,
     validate_fermi_coverage,
     select_projection_orbitals,
+    scdm_select_projections,
     compute_subspace_projections,
     suggest_optimal_window,
     BandWindowResult,
@@ -138,6 +139,29 @@ from .projectability import (
     smart_select_bands,
     ProjectabilityResult,
     SmartSelectionResult,
+)
+
+# Symmetry module
+from .symmetry import (
+    detect_symmetry_operations,
+    build_representation_matrices,
+    symmetrize_real_space_matrices,
+    enforce_hermiticity,
+    enforce_time_reversal,
+    get_orbital_rotation,
+    SymmetryOperation,
+    SymmetryInfo,
+)
+
+# Irrep module
+from .irreps import (
+    compute_little_group,
+    compute_band_characters,
+    identify_band_irreps,
+    select_bands_by_symmetry,
+    find_high_symmetry_kpoints,
+    IrrepResult,
+    BandSelectionResult,
 )
 
 # Public API
@@ -213,6 +237,7 @@ __all__ = [
     'check_frozen_continuity',
     'validate_fermi_coverage',
     'select_projection_orbitals',
+    'scdm_select_projections',
     'compute_subspace_projections',
     'suggest_optimal_window',
     'BandWindowResult',
@@ -232,4 +257,23 @@ __all__ = [
     'smart_select_bands',
     'ProjectabilityResult',
     'SmartSelectionResult',
+
+    # Symmetry
+    'detect_symmetry_operations',
+    'build_representation_matrices',
+    'symmetrize_real_space_matrices',
+    'enforce_hermiticity',
+    'enforce_time_reversal',
+    'get_orbital_rotation',
+    'SymmetryOperation',
+    'SymmetryInfo',
+
+    # Irreps
+    'compute_little_group',
+    'compute_band_characters',
+    'identify_band_irreps',
+    'select_bands_by_symmetry',
+    'find_high_symmetry_kpoints',
+    'IrrepResult',
+    'BandSelectionResult',
 ]

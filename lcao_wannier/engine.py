@@ -415,27 +415,35 @@ class Wannier90Engine:
         
         return self.band_analysis
     
-    def select_projections(self, verbose: bool = True) -> OrbitalSelectionResult:
+    def select_projections(self, verbose: bool = True, method: str = 'weight',
+                           orbital_mask: Optional[np.ndarray] = None) -> OrbitalSelectionResult:
         """
         Automatically select optimal projection orbitals.
-        
+
         For LCAO bases, this selects the orbitals with the largest
         contribution to the selected bands, providing optimal initial
         projections for Wannier90 without user specification.
-        
+
         Must be called after analyze_bands() or after setting
         selected_band_indices manually.
-        
+
         Parameters
         ----------
         verbose : bool, optional
             Print selection details (default: True)
-            
+        method : str, optional
+            Projection selection method:
+            - 'weight': Simple weight-based ranking (default, original method)
+            - 'scdm': SCDM-L (QR column pivoting on Lowdin density matrix)
+        orbital_mask : ndarray of bool, optional
+            Boolean mask for constraining SCDM orbital selection.
+            Only used when method='scdm'. See scdm_select_projections.
+
         Returns
         -------
         OrbitalSelectionResult
             Contains selected orbital indices and weights
-            
+
         Raises
         ------
         RuntimeError
@@ -443,36 +451,50 @@ class Wannier90Engine:
         """
         if self.selected_band_indices is None:
             raise RuntimeError("Must call analyze_bands() first or set selected_band_indices")
-        
+
         if not self.eigenvectors_list:
             raise RuntimeError("Must call solve_all_kpoints() first")
-        
+
         print(f"\n{'=' * 70}")
-        print("Automatic Projection Orbital Selection")
+        print(f"Automatic Projection Orbital Selection (method={method})")
         print(f"{'=' * 70}")
-        
-        self.orbital_selection_result = select_projection_orbitals(
-            self.eigenvectors_list,
-            self.S_k_list,
-            num_wann=self.num_wann,
-            band_indices=self.selected_band_indices
-        )
-        
+
+        if method == 'scdm':
+            from lcao_wannier.band_selection import scdm_select_projections
+            self.orbital_selection_result = scdm_select_projections(
+                self.eigenvectors_list,
+                self.S_k_list,
+                self.eigenvalues_list,
+                num_wann=self.num_wann,
+                e_fermi=self.e_fermi if self.e_fermi is not None else 0.0,
+                band_indices=self.selected_band_indices,
+                orbital_mask=orbital_mask,
+                verbose=verbose,
+            )
+        else:
+            self.orbital_selection_result = select_projection_orbitals(
+                self.eigenvectors_list,
+                self.S_k_list,
+                num_wann=self.num_wann,
+                band_indices=self.selected_band_indices
+            )
+
         self.selected_orbital_indices = self.orbital_selection_result.selected_indices
-        
+
         if verbose:
             print(f"Selected {self.orbital_selection_result.num_selected} projection orbitals")
             print(f"Orbital indices: {self.selected_orbital_indices}")
-            
-            # Show top contributors
-            weights = self.orbital_selection_result.orbital_weights
-            top_indices = np.argsort(weights)[-5:][::-1]
-            print("\nTop 5 contributing orbitals:")
-            for idx in top_indices:
-                print(f"  Orbital {idx}: weight = {weights[idx]:.4f}")
-        
+
+            if method != 'scdm':
+                # Show top contributors (SCDM already prints its own diagnostics)
+                weights = self.orbital_selection_result.orbital_weights
+                top_indices = np.argsort(weights)[-5:][::-1]
+                print("\nTop 5 contributing orbitals:")
+                for idx in top_indices:
+                    print(f"  Orbital {idx}: weight = {weights[idx]:.4f}")
+
         print(f"{'=' * 70}")
-        
+
         return self.orbital_selection_result
     
     def suggest_window(
@@ -803,6 +825,8 @@ class Wannier90Engine:
                 write_hr=True,
                 use_bloch_phases=False,
                 num_iter=self._override_num_iter,
+                guiding_centres=getattr(self, '_guiding_centres', False),
+                additional_keywords=getattr(self, '_additional_keywords', {}),
             )
             write_win_file(self.seedname, win_config, verbose=verbose)
 

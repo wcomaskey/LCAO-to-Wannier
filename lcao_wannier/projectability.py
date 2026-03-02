@@ -207,14 +207,36 @@ def smart_select_bands(
 
         # Auto-compute disentanglement windows (relative to E_F)
         if num_frontier < len(selected) and num_frontier > 0:
-            # Disentanglement is beneficial
-            e_block_min_rel = float(band_energies[selected[0]] - e_fermi)
-            e_block_max_rel = float(band_energies[selected[-1]] - e_fermi)
-            e_front_min_rel = float(band_energies[frontier_indices[0]] - e_fermi)
-            e_front_max_rel = float(band_energies[frontier_indices[-1]] - e_fermi)
+            # Use actual eigenvalue range across ALL k-points (not just band centers)
+            # to ensure the window captures every selected eigenvalue at every k-point
+            e_block_min_rel = float(np.min(all_eigs[:, selected]) - e_fermi)
+            e_block_max_rel = float(np.max(all_eigs[:, selected]) - e_fermi)
+            e_front_min_rel = float(np.min(all_eigs[:, frontier_indices]) - e_fermi)
+            e_front_max_rel = float(np.max(all_eigs[:, frontier_indices]) - e_fermi)
 
-            recommended_dis_win = (e_block_min_rel - 0.5, e_block_max_rel + 0.5)
-            recommended_dis_froz = (e_front_min_rel - 0.5, e_front_max_rel + 0.5)
+            # Frozen window: tight around frontier bands with adaptive padding
+            # Scale padding by frontier bandwidth (min 0.5 eV)
+            frontier_bandwidth = e_front_max_rel - e_front_min_rel
+            froz_padding = max(0.5, 0.1 * frontier_bandwidth)
+            recommended_dis_froz = (e_front_min_rel - froz_padding,
+                                    e_front_max_rel + froz_padding)
+
+            # Outer window: wide to give Wannier90 disentanglement freedom
+            # Use all eigenvalue extrema (not just selected bands) with generous padding
+            e_global_min_rel = float(np.min(all_eigs) - e_fermi)
+            e_global_max_rel = float(np.max(all_eigs) - e_fermi)
+            # Outer window covers all selected bands + extra room beyond frozen window
+            # Ensure at least 1.0 eV gap between frozen and outer on each side
+            min_gap = 1.0  # eV minimum gap between frozen and outer boundaries
+            win_lo = min(e_block_min_rel - 0.5,
+                         recommended_dis_froz[0] - min_gap)
+            win_hi = max(e_block_max_rel + 0.5,
+                         recommended_dis_froz[1] + min_gap)
+            # Also allow Wannier90 access to higher/lower bands for better disentanglement
+            # but cap at global eigenvalue range (no point going beyond available bands)
+            win_lo = max(win_lo, e_global_min_rel - 1.0)
+            win_hi = min(win_hi, e_global_max_rel + 1.0)
+            recommended_dis_win = (win_lo, win_hi)
         else:
             # All bands are frontier — no disentanglement needed
             recommended_dis_win = None

@@ -116,6 +116,7 @@ class Wannier90WinConfig:
     spinors: bool = False
     fermi_energy: Optional[float] = None
     use_bloch_phases: bool = False
+    guiding_centres: bool = False
 
     # Band structure path (optional)
     kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None
@@ -265,6 +266,8 @@ def write_win_file(
     lines.append(f"conv_tol = {config.conv_tol:.2e}")
     lines.append(f"conv_window = {config.conv_window}")
     lines.append(f"num_print_cycles = {config.num_print_cycles}")
+    if config.guiding_centres:
+        lines.append("guiding_centres = .true.")
     lines.append("")
 
     # Output options
@@ -613,7 +616,9 @@ def parse_atoms_from_crystal_output(lines: List[str]) -> Tuple[List[Tuple[str, n
             parts = line.split()
             if len(parts) >= 7:
                 try:
-                    symbol = parts[2]
+                    # Normalize symbol: CRYSTAL uses ALL-CAPS (TE, SN, BI)
+                    # Convert to standard form (Te, Sn, Bi)
+                    symbol = parts[2].capitalize()
                     # Coordinates are typically in columns 4, 5, 6 (0-indexed)
                     x = float(parts[4])
                     y = float(parts[5])

@@ -9,6 +9,9 @@ Functions:
 - compute_band_character: Decompose band into element/orbital contributions
 - analyze_all_bands_character: Compute character for multiple bands
 - identify_dominant_character: Identify dominant orbital type in a band
+- analyze_orbital_type_contributions: Per-type projectability weights near E_F
+- compute_symmetry_aware_num_wann: Complete-shell num_wann from selected types
+- build_orbital_mask: Boolean mask for constraining SCDM to selected shell types
 """
 
 import numpy as np
@@ -368,3 +371,290 @@ def format_band_character_table(
     lines.append("=" * len(header))
 
     return "\n".join(lines)
+
+
+# ============================================================================
+# Symmetry-aware orbital selection helpers
+# ============================================================================
+
+# Mapping from orbital type to angular momentum dimension
+_ORBITAL_DIM = {'s': 1, 'p': 3, 'd': 5, 'f': 7, 'g': 9}
+
+
+def analyze_orbital_type_contributions(
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    eigenvalues_list: List[np.ndarray],
+    orbital_types: Dict[int, str],
+    e_fermi: float,
+    energy_window: Tuple[float, float] = (-5.0, 3.0),
+    has_soc: bool = False,
+    verbose: bool = False,
+) -> Dict[str, float]:
+    """
+    Compute k-averaged projectability weights grouped by orbital type near E_F.
+
+    For each k-point, computes the Löwdin projection of occupied/near-Fermi
+    bands onto the AO basis, then groups by orbital type (s, p, d, f).
+    Returns a dict of type → total weight, normalized so that the sum = 1.
+
+    Parameters
+    ----------
+    eigenvectors_list : list of ndarray
+        Eigenvectors C(k) for each k-point, shape (num_orbitals, num_bands)
+    S_k_list : list of ndarray
+        Overlap matrices S(k) for each k-point, shape (num_orbitals, num_orbitals)
+    eigenvalues_list : list of ndarray
+        Eigenvalues for each k-point, shape (num_bands,)
+    orbital_types : dict
+        Maps orbital index (1-indexed) → orbital type ('s', 'p', 'd', etc.)
+    e_fermi : float
+        Fermi energy in eV
+    energy_window : tuple of float
+        (E_min, E_max) relative to E_fermi for selecting relevant bands
+    has_soc : bool
+        Whether spin-orbit coupling doubles the basis
+    verbose : bool
+        Print diagnostic information
+
+    Returns
+    -------
+    dict
+        Maps orbital type → total contribution weight (0.0 to 1.0).
+        Example: {'s': 0.15, 'p': 0.72, 'd': 0.13}
+    """
+    num_kpoints = len(eigenvectors_list)
+    num_orbitals = eigenvectors_list[0].shape[0]
+
+    # Build orbital type array for all AO indices (0-indexed)
+    orb_type_array = []
+    for i in range(num_orbitals):
+        # orbital_types uses 1-indexed keys
+        orb_type_array.append(orbital_types.get(i + 1, 'unknown'))
+
+    # Accumulate per-type weights
+    type_weights = {}
+    total_weight = 0.0
+
+    win_min = e_fermi + energy_window[0]
+    win_max = e_fermi + energy_window[1]
+
+    for ik in range(num_kpoints):
+        C_k = eigenvectors_list[ik]
+        S_k = S_k_list[ik]
+        evals = eigenvalues_list[ik]
+
+        # Select bands within energy window
+        in_window = (evals >= win_min) & (evals <= win_max)
+        band_mask = np.where(in_window)[0]
+
+        if len(band_mask) == 0:
+            continue
+
+        C_sel = C_k[:, band_mask]  # (num_orbitals, num_bands_in_window)
+
+        # Compute S^{1/2}
+        eigvals_s, eigvecs_s = np.linalg.eigh(S_k)
+        eigvals_s = np.maximum(eigvals_s, 1e-12)
+        S_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.conj().T
+
+        # Löwdin-transformed density matrix: P_L(k) = S^{1/2} C C^dag S^{1/2}
+        # We just need the diagonal: sum_n |[S^{1/2} C]_{mu,n}|^2
+        SC = S_sqrt @ C_sel  # (num_orbitals, num_bands_in_window)
+        diag_weights = np.sum(np.abs(SC) ** 2, axis=1)  # (num_orbitals,)
+
+        # Group by orbital type
+        for mu in range(num_orbitals):
+            otype = orb_type_array[mu]
+            if otype not in type_weights:
+                type_weights[otype] = 0.0
+            type_weights[otype] += diag_weights[mu]
+            total_weight += diag_weights[mu]
+
+    # Normalize
+    if total_weight > 1e-10:
+        for key in type_weights:
+            type_weights[key] /= total_weight
+
+    # Remove 'unknown' if negligible
+    type_weights.pop('unknown', None)
+
+    if verbose:
+        print(f"  Orbital type contributions (E_F ± window [{energy_window[0]:.1f}, {energy_window[1]:.1f}] eV):")
+        for otype in sorted(type_weights.keys()):
+            print(f"    {otype}: {type_weights[otype]*100:.1f}%")
+
+    return type_weights
+
+
+def compute_symmetry_aware_num_wann(
+    selected_types: List[str],
+    orbital_structure: List[List[str]],
+    has_soc: bool = False,
+    verbose: bool = False,
+) -> Tuple[int, List[List[str]]]:
+    """
+    Compute num_wann for complete orbital shells on all atoms.
+
+    Given a set of orbital types to include (e.g., ['p'] or ['s', 'p']),
+    computes the total Wannier function count that forms a complete
+    representation under the crystal's space group.
+
+    Parameters
+    ----------
+    selected_types : list of str
+        Orbital types to include, e.g. ['p'], ['s', 'p'], ['s', 'p', 'd']
+    orbital_structure : list of list of str
+        Per-atom list of orbital shells from get_orbital_structure_from_crystal.
+        E.g., [['s', 's', 'p', 'p', 'p', 'd', 'd', 'd'], ['s', 's', ...]]
+    has_soc : bool
+        Whether SOC doubles the basis (spinor_factor = 2 if True)
+    verbose : bool
+        Print diagnostic information
+
+    Returns
+    -------
+    num_wann : int
+        Total number of Wannier functions
+    wannier_orbital_structure : list of list of str
+        Per-atom list of unique included shell types (for WannSym compatibility).
+        E.g., [['p'], ['p']] for 'p' selection on 2 atoms.
+        Only one shell per angular momentum type is included (multi-zeta
+        basis sets may have multiple radial functions of the same type,
+        but WannSym needs exactly one complete angular momentum shell).
+    """
+    spinor_factor = 2 if has_soc else 1
+    selected_set = set(t.lower() for t in selected_types)
+    type_order = ['s', 'p', 'd', 'f', 'g']
+
+    wannier_orbital_structure = []
+    total_spatial_wann = 0
+
+    for atom_idx, atom_shells in enumerate(orbital_structure):
+        # Get UNIQUE orbital types present on this atom that match selection.
+        # WannSym needs ONE complete shell per angular momentum type,
+        # not all multi-zeta shells of that type.
+        unique_types = []
+        for t in type_order:
+            if t in selected_set and t in [s.lower() for s in atom_shells]:
+                unique_types.append(t)
+        wannier_orbital_structure.append(unique_types)
+
+        atom_dim = sum(_ORBITAL_DIM.get(t, 0) for t in unique_types)
+        total_spatial_wann += atom_dim
+
+    num_wann = total_spatial_wann * spinor_factor
+
+    if verbose:
+        print(f"  Symmetry-aware num_wann calculation:")
+        print(f"    Selected orbital types: {selected_types}")
+        print(f"    Spinor factor: {spinor_factor}")
+        for i, shells in enumerate(wannier_orbital_structure):
+            dim = sum(_ORBITAL_DIM.get(s.lower(), 0) for s in shells)
+            print(f"    Atom {i}: shells={shells}, dim={dim}")
+        print(f"    Total num_wann = {total_spatial_wann} × {spinor_factor} = {num_wann}")
+
+    return num_wann, wannier_orbital_structure
+
+
+def build_orbital_mask(
+    orbital_types: Dict[int, str],
+    selected_types: List[str],
+    num_orbitals: int,
+    has_soc: bool = False,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Build a boolean mask for SCDM orbital constraint.
+
+    Creates a mask of shape (num_orbitals,) where True means the orbital
+    is allowed for SCDM selection (it belongs to one of the selected types).
+
+    Parameters
+    ----------
+    orbital_types : dict
+        Maps orbital index (1-indexed) → orbital type ('s', 'p', 'd', etc.)
+    selected_types : list of str
+        Orbital types to include (e.g., ['p'], ['s', 'p'])
+    num_orbitals : int
+        Total number of orbitals (including SOC doubling if applicable)
+    has_soc : bool
+        Whether SOC doubles the basis
+    verbose : bool
+        Print diagnostic information
+
+    Returns
+    -------
+    ndarray of bool
+        Boolean mask, shape (num_orbitals,)
+
+    Examples
+    --------
+    >>> mask = build_orbital_mask(orb_types, ['p'], 112, has_soc=True)
+    >>> # For Bi bilayer: 6 p-orbitals per atom × 2 atoms × 2 spin = 24 True entries
+    """
+    selected_set = set(t.lower() for t in selected_types)
+    mask = np.zeros(num_orbitals, dtype=bool)
+
+    for i in range(num_orbitals):
+        otype = orbital_types.get(i + 1, 'unknown')
+        if otype.lower() in selected_set:
+            mask[i] = True
+
+    if verbose:
+        n_allowed = np.sum(mask)
+        print(f"  Orbital mask: {n_allowed}/{num_orbitals} orbitals selected")
+        for t in sorted(selected_set):
+            count = sum(1 for i in range(num_orbitals)
+                        if orbital_types.get(i + 1, '').lower() == t)
+            print(f"    {t}: {count} orbitals")
+
+    return mask
+
+
+def auto_select_orbital_types(
+    type_contributions: Dict[str, float],
+    threshold: float = 0.15,
+    verbose: bool = False,
+) -> List[str]:
+    """
+    Automatically select which orbital types to include based on contributions.
+
+    Selects orbital types that have contributions above the threshold.
+    Always includes at least the dominant type.
+
+    Parameters
+    ----------
+    type_contributions : dict
+        Maps orbital type → contribution weight from analyze_orbital_type_contributions
+    threshold : float
+        Minimum contribution to include a type (default: 0.15 = 15%)
+    verbose : bool
+        Print diagnostic information
+
+    Returns
+    -------
+    list of str
+        Selected orbital types in order: s, p, d, f
+    """
+    # Standard ordering
+    type_order = ['s', 'p', 'd', 'f', 'g']
+
+    # Select types above threshold
+    selected = [t for t in type_order
+                if type_contributions.get(t, 0.0) >= threshold]
+
+    # If nothing selected, take the dominant type
+    if not selected and type_contributions:
+        dominant = max(type_contributions, key=type_contributions.get)
+        selected = [dominant]
+
+    if verbose:
+        print(f"  Auto-detected orbital types (threshold={threshold*100:.0f}%): {selected}")
+        for t in type_order:
+            w = type_contributions.get(t, 0.0)
+            marker = " ←" if t in selected else ""
+            if w > 0.001:
+                print(f"    {t}: {w*100:.1f}%{marker}")
+
+    return selected

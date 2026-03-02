@@ -14,14 +14,17 @@ from .fourier import fourier_transform_to_kspace
 def solve_generalized_eigenvalue_problem(
     H_k: np.ndarray,
     S_k: np.ndarray,
-    num_wann: int = None
+    num_wann: int = None,
+    overlap_threshold: float = 1e-6
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Solve the generalized eigenvalue problem H(k) C = S(k) C E.
-    
+
     Uses scipy.linalg.eigh for Hermitian matrices, which is more stable
-    and efficient than the general eigenvalue solver.
-    
+    and efficient than the general eigenvalue solver. Falls back to
+    Löwdin orthogonalization when the overlap matrix is near-singular
+    (common with large basis sets or highly contracted shells).
+
     Parameters
     ----------
     H_k : ndarray of shape (num_orbitals, num_orbitals)
@@ -31,30 +34,62 @@ def solve_generalized_eigenvalue_problem(
     num_wann : int, optional
         Number of lowest eigenvalues/eigenvectors to keep
         If None, keeps all
-    
+    overlap_threshold : float
+        Eigenvalues of S below this threshold are discarded
+        (removes near-linear dependencies in the basis)
+
     Returns
     -------
     eigenvalues : ndarray of shape (num_wann,)
         Eigenvalues sorted in ascending order
     eigenvectors : ndarray of shape (num_orbitals, num_wann)
         Eigenvectors (columns), normalized such that C† S C = I
-    
+
     Notes
     -----
     The generalized eigenvalue problem is:
         H(k) C(k) = S(k) C(k) E(k)
-    
+
     scipy.linalg.eigh automatically sorts eigenvalues in ascending order
     and normalizes eigenvectors according to C† S C = I.
+
+    When S is near-singular, we use Löwdin orthogonalization:
+    1. Diagonalize S = U s U†
+    2. Discard eigenvectors with s < threshold
+    3. Form X = U s^{-1/2} in the reduced space
+    4. Solve X† H X c = e c (standard eigenvalue problem)
+    5. Back-transform: C = X c
     """
-    # Solve generalized eigenvalue problem
-    eigenvalues, eigenvectors = eigh(H_k, S_k)
-    
+    try:
+        eigenvalues, eigenvectors = eigh(H_k, S_k)
+    except np.linalg.LinAlgError:
+        # Overlap matrix is not positive definite — use Löwdin orthogonalization
+        s_evals, U = eigh(S_k)
+
+        # Keep only basis functions with significant overlap eigenvalues
+        mask = s_evals > overlap_threshold
+        n_kept = np.sum(mask)
+
+        s_kept = s_evals[mask]
+        U_kept = U[:, mask]
+
+        # Löwdin transformation matrix: X = U s^{-1/2}
+        X = U_kept * (1.0 / np.sqrt(s_kept))[np.newaxis, :]
+
+        # Transform to orthonormal basis: H_orth = X† H X
+        H_orth = X.conj().T @ H_k @ X
+
+        # Solve standard eigenvalue problem
+        eigenvalues, c = eigh(H_orth)
+
+        # Back-transform eigenvectors to original basis
+        eigenvectors = X @ c
+
     # Keep only the lowest num_wann eigenvalues and eigenvectors
     if num_wann is not None:
         eigenvalues = eigenvalues[:num_wann]
         eigenvectors = eigenvectors[:, :num_wann]
-    
+
     return eigenvalues, eigenvectors
 
 
@@ -192,7 +227,8 @@ def solve_all_kpoints_parallel(
     from functools import partial
     
     if num_processes is None:
-        num_processes = min(mp.cpu_count(), len(k_points))
+        # Use at most half the CPUs to avoid saturating the system
+        num_processes = min(max(1, mp.cpu_count() // 2), len(k_points))
     
     # Create partial function with fixed parameters
     solve_func = partial(

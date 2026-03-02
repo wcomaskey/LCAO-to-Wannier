@@ -6,9 +6,181 @@ This module contains functions for writing Wannier90 input files
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 
 from .fourier import fourier_transform_to_kspace
+
+
+def diagnose_mmn_matrix(
+    M: np.ndarray,
+    k_idx: int,
+    next_k_idx: int,
+    G_shift: Tuple[int, int, int],
+    tolerance: float = 1e-6
+) -> Dict[str, Any]:
+    """
+    Diagnose properties of an MMN matrix for debugging.
+
+    Parameters
+    ----------
+    M : ndarray
+        The MMN matrix, shape (num_bands, num_bands)
+    k_idx : int
+        Current k-point index
+    next_k_idx : int
+        Neighbor k-point index
+    G_shift : tuple
+        The G-vector shift (n1, n2, n3)
+    tolerance : float
+        Tolerance for numerical checks
+
+    Returns
+    -------
+    diagnostics : dict
+        Dictionary with diagnostic information:
+        - 'trace': Trace of M (should be real and close to num_bands for identity)
+        - 'det': Determinant of M (magnitude should be close to 1 for unitary)
+        - 'is_identity': True if M is close to identity (for self-overlap)
+        - 'singular_values': Singular values (should all be close to 1 for unitary)
+        - 'max_off_diag': Maximum off-diagonal element magnitude
+        - 'hermitian_error': ||M†M - I|| / num_bands
+    """
+    num_bands = M.shape[0]
+
+    trace = np.trace(M)
+    det = np.linalg.det(M)
+
+    # Singular value decomposition
+    U, s, Vh = np.linalg.svd(M)
+
+    # Check if M is identity (for self-overlap with G=0)
+    identity_error = np.linalg.norm(M - np.eye(num_bands)) / num_bands
+    is_identity = identity_error < tolerance
+
+    # Check off-diagonal elements
+    diag_mask = np.eye(num_bands, dtype=bool)
+    off_diag = np.abs(M[~diag_mask])
+    max_off_diag = np.max(off_diag) if len(off_diag) > 0 else 0.0
+
+    # Check unitarity: M†M should be identity
+    MdagM = M.conj().T @ M
+    hermitian_error = np.linalg.norm(MdagM - np.eye(num_bands)) / num_bands
+
+    return {
+        'k_idx': k_idx,
+        'next_k_idx': next_k_idx,
+        'G_shift': G_shift,
+        'trace': trace,
+        'det': det,
+        'det_magnitude': np.abs(det),
+        'is_identity': is_identity,
+        'identity_error': identity_error,
+        'singular_values': s,
+        'sv_min': np.min(s),
+        'sv_max': np.max(s),
+        'max_off_diag': max_off_diag,
+        'hermitian_error': hermitian_error,
+        'is_unitary': hermitian_error < tolerance and np.abs(np.abs(det) - 1) < tolerance
+    }
+
+
+def compute_mmn_direct(
+    k_idx: int,
+    next_k_idx: int,
+    kpoints: np.ndarray,
+    b_vector_cart: np.ndarray,
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    lattice_vectors: np.ndarray,
+    atom_positions: np.ndarray,
+    basis_atom_map: np.ndarray,
+    eigenvectors: List[np.ndarray],
+    symmetrize: bool = True,
+    G_shift: np.ndarray = None
+) -> np.ndarray:
+    """
+    Compute M_mn using the Symmetric Midpoint Approximation.
+
+    This implements the correct MMN matrix for LCAO methods using the
+    2π phase convention, which ensures proper BZ periodicity: S(k+G) = S(k).
+
+    The method evaluates S at the physical midpoint between k and k+b:
+    M_mn = C_m^†(k) · S(k + b/2) · C_n(k+b)
+
+    Parameters
+    ----------
+    k_idx : int
+        Index of the current k-point
+    next_k_idx : int
+        Index of the neighbor k-point
+    kpoints : ndarray of shape (num_kpoints, 3)
+        K-points in fractional coordinates
+    b_vector_cart : ndarray of shape (3,)
+        Cartesian b-vector connecting k to k+b (unused, kept for API)
+    real_space_matrices : dict
+        Dict mapping (n1,n2,n3) -> {'H': H_matrix, 'S': S_matrix}
+    lattice_vectors : ndarray of shape (3, 3)
+        Real-space lattice vectors (rows are [a1, a2, a3])
+    atom_positions : ndarray of shape (num_atoms, 3)
+        Atomic positions (unused, kept for API compatibility)
+    basis_atom_map : ndarray of shape (num_orbitals,)
+        Maps each orbital to its atom index (unused, kept for API)
+    eigenvectors : list of ndarray
+        Eigenvector matrices C(k), shape (num_orbitals, num_bands)
+    symmetrize : bool, optional
+        Not used in this implementation.
+    G_shift : ndarray of shape (3,), optional
+        Integer G-vector shift from .nnkp file
+
+    Returns
+    -------
+    M_mn : ndarray
+        MMN overlap matrix, shape (num_bands, num_bands)
+    """
+    k_curr = kpoints[k_idx]
+    k_next = kpoints[next_k_idx]
+
+    # Use G_shift from nnkp file (passed as parameter)
+    # This tells us the BZ wrapping: k' + G = k + b (physical path)
+    if G_shift is None:
+        G_shift = np.zeros(3, dtype=int)
+    G_shift = np.asarray(G_shift)
+
+    # Calculate PHYSICAL b-vector in fractional coordinates
+    # b = k_next + G_shift - k_curr (this is the actual displacement)
+    b_frac = k_next + G_shift - k_curr
+
+    # Calculate PHYSICAL Midpoint
+    # k_mid is the actual location in reciprocal space where overlap occurs
+    k_mid = k_curr + 0.5 * b_frac
+
+    # Debug for BZ boundary cases
+    debug_this = (k_idx == 0 and np.any(G_shift != 0))
+    if debug_this:
+        print(f"\n=== DEBUG MMN for k_idx=0, BZ boundary crossing ===")
+        print(f"  k_curr = {k_curr}")
+        print(f"  k_next = {k_next}")
+        print(f"  G_shift (from nnkp) = {G_shift}")
+        print(f"  b_frac = k_next + G_shift - k_curr = {b_frac}")
+        print(f"  k_mid = k_curr + 0.5*b_frac = {k_mid}")
+
+    # Compute S at the midpoint using fourier_transform_to_kspace
+    # With 2π convention, S(k_mid) = S(k_mid + G) for any G, so no correction needed
+    _, S_mid = fourier_transform_to_kspace(k_mid, real_space_matrices, lattice_vectors)
+
+    # Project onto eigenvectors
+    C_k = eigenvectors[k_idx]
+    C_next = eigenvectors[next_k_idx]
+
+    M_mn = C_k.conj().T @ S_mid @ C_next
+
+    # Debug: print |det(M)| for boundary crossings
+    if debug_this:
+        det_M = np.linalg.det(M_mn)
+        print(f"  |det(M)| = {np.abs(det_M):.6f}")
+        U, s, Vh = np.linalg.svd(M_mn)
+        print(f"  Singular values: min={s.min():.4f}, max={s.max():.4f}")
+
+    return M_mn
 
 
 def compute_mmn_matrix(
@@ -24,6 +196,9 @@ def compute_mmn_matrix(
 ) -> np.ndarray:
     """
     Compute M_mn matrix using the Symmetric Midpoint Approximation.
+
+    DEPRECATED: Use compute_mmn_direct() instead, which uses the correct
+    real-space formula consistent with the π convention.
 
     This implements the correct MMN matrix calculation for LCAO methods,
     accounting for periodic boundary conditions via the physical b-vector.
@@ -109,6 +284,8 @@ def compute_mmn_matrix(
     M_mn = C_k.conj().T @ S_cross @ C_next
 
     return M_mn
+
+
 
 
 def write_eig_file(
@@ -302,20 +479,23 @@ def write_mmn_file_lcao(
     basis_atom_map: np.ndarray,
     num_kpoints: int,
     num_wann: int,
-    convention: str = 'pi'
+    convention: str = 'pi',
+    use_direct_method: bool = True,
+    verbose: bool = False
 ) -> None:
     """
-    Write the .mmn file for LCAO methods using the Symmetric Midpoint Method.
+    Write the .mmn file for LCAO methods.
 
-    This implements the correct MMN matrix calculation using the symmetric
-    midpoint approximation, which properly handles periodic boundary conditions
-    by using the physical b-vector rather than averaging k-point coordinates.
+    This implements the MMN matrix calculation for LCAO methods with two
+    available algorithms:
 
-    The method:
-        1. Computes k_mid = k + 0.5 * b_frac (using b-vector for PBC)
-        2. Evaluates S(k_mid) via Fourier transform
-        3. Applies symmetric Berry phase: exp[-i * b · (τ_i + τ_j) / 2]
-        4. Projects onto eigenvectors: M = C†(k) @ S_cross @ C(k+b)
+    1. Direct method (use_direct_method=True, default):
+       Uses direct real-space summation with explicit phase factors.
+       Formula: M_mn = Σ_R exp(i*π*b·R) * exp(-i*b·(τ_j-τ_i)) * C†(k) S(R) C(k+b)
+
+    2. Symmetric midpoint method (use_direct_method=False):
+       Evaluates S at midpoint k + 0.5*b with Berry phase correction.
+       Formula: M = C†(k) @ S(k_mid) @ phase_matrix @ C(k+b)
 
     Parameters
     ----------
@@ -344,13 +524,24 @@ def write_mmn_file_lcao(
         Number of Wannier functions (selected bands)
     convention : str, optional
         'pi' for π convention (Crystal23), '2pi' for 2π convention
-        Default is 'pi' (unused in symmetric midpoint method)
+        Default is 'pi'
+    use_direct_method : bool, optional
+        If True, use the direct real-space method (default).
+        If False, use the symmetric midpoint method.
+    verbose : bool, optional
+        If True, print diagnostic information (default: False)
     """
+    method_name = "Direct Real-Space" if use_direct_method else "Symmetric Midpoint"
+
     with open(filename, 'w') as f:
         # Write header
-        f.write("Created by LCAO-to-Wannier90 (Symmetric Midpoint Method)\n")
+        f.write(f"Created by LCAO-to-Wannier90 ({method_name} Method)\n")
         num_neighbors = len(neighbor_list[0])
         f.write(f"{num_wann:5d} {num_kpoints:5d} {num_neighbors:5d}\n")
+
+        # Diagnostic tracking
+        if verbose:
+            diag_traces = []  # Track trace of M matrices (should be close to num_wann for identity)
 
         # Process each k-point
         for k_idx in range(num_kpoints):
@@ -360,12 +551,26 @@ def write_mmn_file_lcao(
                 G_shift = neighbor['G_shift']
                 b_vec_cart = neighbor['b_vec_cart']  # Cartesian b-vector
 
-                # Compute MMN matrix using symmetric midpoint method
-                M_kb = compute_mmn_matrix(
-                    k_idx, k_next_idx, kpoints, b_vec_cart,
-                    real_space_matrices, lattice_vectors,
-                    atom_positions, basis_atom_map, eigenvectors_list
-                )
+                # Compute MMN matrix using selected method
+                if use_direct_method:
+                    M_kb = compute_mmn_direct(
+                        k_idx, k_next_idx, kpoints, b_vec_cart,
+                        real_space_matrices, lattice_vectors,
+                        atom_positions, basis_atom_map, eigenvectors_list,
+                        symmetrize=True,
+                        G_shift=G_shift  # Pass G_shift for correct b-vector computation
+                    )
+                else:
+                    M_kb = compute_mmn_matrix(
+                        k_idx, k_next_idx, kpoints, b_vec_cart,
+                        real_space_matrices, lattice_vectors,
+                        atom_positions, basis_atom_map, eigenvectors_list
+                    )
+
+                # Diagnostic: check if this is a self-overlap (k_idx == k_next_idx with G=0)
+                if verbose and k_idx == k_next_idx and tuple(G_shift) == (0, 0, 0):
+                    trace = np.trace(M_kb)
+                    diag_traces.append((k_idx, trace))
 
                 # --- WRITE TO FILE ---
                 # Write neighbor identification line
@@ -377,6 +582,12 @@ def write_mmn_file_lcao(
                     for m in range(num_wann):
                         val = M_kb[m, n]
                         f.write(f"{val.real:18.12f} {val.imag:18.12f}\n")
+
+        if verbose and diag_traces:
+            print(f"\n  MMN Diagnostics ({method_name} method):")
+            print(f"  Self-overlap traces (should be ≈ {num_wann}):")
+            for k_idx, trace in diag_traces:
+                print(f"    k={k_idx}: Tr(M) = {trace.real:.6f} + {trace.imag:.6f}i")
 
 
 def write_mmn_file(

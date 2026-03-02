@@ -2,9 +2,10 @@
 Fourier Transform Module
 
 This module contains functions for Fourier transforming real-space matrices
-to k-space using the phase factor e^(i π k·R).
+to k-space using the phase factor e^(i 2π k·R).
 
-NOTE: This uses the π convention (not 2π) which is correct for Crystal23.
+NOTE: This uses the standard 2π convention which ensures proper BZ periodicity:
+      H(k+G) = H(k) and S(k+G) = S(k) for any reciprocal lattice vector G.
 """
 
 import numpy as np
@@ -18,13 +19,14 @@ def fourier_transform_to_kspace(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fourier transform real-space H(R) and S(R) matrices to k-space.
-    
+
     Computes:
-        H(k) = Σ_R e^(i π k·R) H(R)
-        S(k) = Σ_R e^(i π k·R) S(R)
-    
-    NOTE: Uses π convention (not 2π) for compatibility with Crystal23.
-    
+        H(k) = Σ_R e^(i 2π k·R) H(R)
+        S(k) = Σ_R e^(i 2π k·R) S(R)
+
+    Uses the standard 2π convention which ensures BZ periodicity:
+    H(k+G) = H(k) for any reciprocal lattice vector G (integer).
+
     Parameters
     ----------
     k_point : ndarray of shape (3,)
@@ -34,22 +36,22 @@ def fourier_transform_to_kspace(
         where H_matrix and S_matrix are complex ndarrays
     lattice_vectors : ndarray of shape (3, 3)
         Real-space lattice vectors (rows are vectors)
-    
+
     Returns
     -------
     H_k : ndarray
         Hamiltonian in k-space, shape (num_orbitals, num_orbitals)
     S_k : ndarray
         Overlap matrix in k-space, shape (num_orbitals, num_orbitals)
-    
+
     Notes
     -----
-    The phase factor is computed as exp(i π k·R) where k is in fractional
+    The phase factor is computed as exp(i 2π k·R) where k is in fractional
     coordinates and R is in integer lattice coordinates.
-    
-    Crystal23 uses the π convention, not 2π. This is important for
-    correct band structure reproduction.
-    
+
+    The 2π convention ensures that exp(i 2π G·R) = 1 for integer G and R,
+    which gives proper Brillouin zone periodicity H(k+G) = H(k).
+
     Examples
     --------
     >>> k = np.array([0.25, 0.25, 0.25])
@@ -58,23 +60,23 @@ def fourier_transform_to_kspace(
     # Get matrix dimensions from first entry
     first_key = next(iter(real_space_matrices))
     num_orbitals = real_space_matrices[first_key]['H'].shape[0]
-    
+
     # Initialize k-space matrices
     H_k = np.zeros((num_orbitals, num_orbitals), dtype=np.complex128)
     S_k = np.zeros((num_orbitals, num_orbitals), dtype=np.complex128)
-    
+
     # Loop over all R vectors and accumulate Fourier sum
     for R_tuple, matrices in real_space_matrices.items():
         R = np.array(R_tuple)
-        
-        # Calculate phase factor: e^(i π k·R)
-        # Using π convention for Crystal23 compatibility
-        phase = np.exp(1j * np.pi * np.dot(k_point, R))
-        
+
+        # Calculate phase factor: e^(i 2π k·R)
+        # Using 2π convention for proper BZ periodicity
+        phase = np.exp(2j * np.pi * np.dot(k_point, R))
+
         # Accumulate the Fourier sum
         H_k += phase * matrices['H']
         S_k += phase * matrices['S']
-    
+
     return H_k, S_k
 
 
@@ -87,13 +89,13 @@ def inverse_fourier_transform(
 ) -> Dict[Tuple[int, int, int], Dict[str, np.ndarray]]:
     """
     Inverse Fourier transform from k-space to real-space (optional utility).
-    
+
     Computes:
-        H(R) = (1/N_k) Σ_k e^(-i π k·R) H(k)
-        S(R) = (1/N_k) Σ_k e^(-i π k·R) S(k)
-    
-    NOTE: Uses π convention (not 2π) for compatibility with Crystal23.
-    
+        H(R) = (1/N_k) Σ_k e^(-i 2π k·R) H(k)
+        S(R) = (1/N_k) Σ_k e^(-i 2π k·R) S(k)
+
+    Uses the standard 2π convention for proper BZ periodicity.
+
     Parameters
     ----------
     k_points : ndarray of shape (num_kpoints, 3)
@@ -106,7 +108,7 @@ def inverse_fourier_transform(
         List of R vectors to compute
     k_grid : tuple of 3 ints
         Dimensions of the k-point grid
-    
+
     Returns
     -------
     real_space_matrices : dict
@@ -115,25 +117,25 @@ def inverse_fourier_transform(
     num_kpoints = len(k_points)
     num_orbitals = H_k_list[0].shape[0]
     real_space_matrices = {}
-    
+
     for R_tuple in R_vectors:
         R = np.array(R_tuple)
         H_R = np.zeros((num_orbitals, num_orbitals), dtype=np.complex128)
         S_R = np.zeros((num_orbitals, num_orbitals), dtype=np.complex128)
-        
+
         for k_idx, k_point in enumerate(k_points):
-            # Phase factor: e^(-i π k·R) - using π convention
-            phase = np.exp(-1j * np.pi * np.dot(k_point, R))
-            
+            # Phase factor: e^(-i 2π k·R) - using 2π convention
+            phase = np.exp(-2j * np.pi * np.dot(k_point, R))
+
             H_R += phase * H_k_list[k_idx]
             S_R += phase * S_k_list[k_idx]
-        
+
         # Normalize by number of k-points
         H_R /= num_kpoints
         S_R /= num_kpoints
-        
+
         real_space_matrices[R_tuple] = {'H': H_R, 'S': S_R}
-    
+
     return real_space_matrices
 
 
@@ -154,7 +156,7 @@ def compute_phase_factors(
     Returns
     -------
     phase_factors : ndarray of shape (num_kpoints, num_R_vectors)
-        Pre-computed phase factors using π convention
+        Pre-computed phase factors using 2π convention
     """
     num_kpoints = len(k_points)
     num_R = len(R_vectors)
@@ -163,8 +165,8 @@ def compute_phase_factors(
     for k_idx, k_point in enumerate(k_points):
         for R_idx, R_tuple in enumerate(R_vectors):
             R = np.array(R_tuple)
-            # Using π convention for Crystal23 compatibility
-            phase_factors[k_idx, R_idx] = np.exp(1j * np.pi * np.dot(k_point, R))
+            # Using 2π convention for proper BZ periodicity
+            phase_factors[k_idx, R_idx] = np.exp(2j * np.pi * np.dot(k_point, R))
 
     return phase_factors
 

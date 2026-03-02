@@ -674,6 +674,203 @@ def compute_subspace_projections(
     return A_k_list
 
 
+def scdm_select_projections(
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    eigenvalues_list: List[np.ndarray],
+    num_wann: int,
+    e_fermi: float = 0.0,
+    mu: Optional[float] = None,
+    sigma: Optional[float] = None,
+    method: str = 'erfc',
+    band_indices: Optional[np.ndarray] = None,
+    orbital_mask: Optional[np.ndarray] = None,
+    verbose: bool = True,
+) -> OrbitalSelectionResult:
+    """
+    Select projection orbitals using SCDM-L (Selected Columns of the
+    Density Matrix with Lowdin orthogonalization).
+
+    Unlike the weight-based method (select_projection_orbitals) which ranks
+    orbitals independently by their projection weight, SCDM-L uses QR
+    factorization with column pivoting (QRCP) on the k-averaged Lowdin
+    density matrix to select a maximally independent set of orbitals.
+    This accounts for correlations between orbitals and avoids selecting
+    redundant projections.
+
+    Parameters
+    ----------
+    eigenvectors_list : list of ndarrays
+        Eigenvectors C(k) for each k-point, shape (num_orbitals, num_bands)
+    S_k_list : list of ndarrays
+        Overlap matrices S(k) for each k-point, shape (num_orbitals, num_orbitals)
+    eigenvalues_list : list of ndarrays
+        Eigenvalues for each k-point, shape (num_bands,)
+    num_wann : int
+        Number of Wannier functions (orbitals to select)
+    e_fermi : float
+        Fermi energy in eV
+    mu : float, optional
+        Energy centre for occupation function. Default: e_fermi
+    sigma : float, optional
+        Energy width for occupation function in eV. Default: auto from band gap
+    method : str
+        Occupation weighting function:
+        - 'erfc': f(e) = 0.5 * erfc((e - mu) / sigma) — smooth Fermi-like
+        - 'gaussian': f(e) = exp(-((e - mu) / sigma)^2) — symmetric around mu
+        - 'isolated': f(e) = 1 — all bands weighted equally
+    band_indices : ndarray, optional
+        Restrict to these band indices. If None, use all bands.
+    orbital_mask : ndarray of bool, optional
+        Boolean mask of shape (num_orbitals,) indicating which AO indices
+        are valid for selection. When provided, columns of the Löwdin
+        density matrix corresponding to False entries are zeroed out before
+        QR pivoting, forcing SCDM to only select from the desired orbital
+        subspace. This is used by --symmetrize to constrain projections to
+        complete orbital shells. If None, all orbitals are eligible.
+    verbose : bool
+        Print diagnostic information
+
+    Returns
+    -------
+    OrbitalSelectionResult
+        Contains selected orbital indices, weights, and count
+
+    References
+    ----------
+    Damle, Lin, Ying, J. Comput. Phys. 334, 1 (2017) — SCDM-k method
+    Qiu et al., J. Chem. Theory Comput. 17, 7373 (2021) — SCDM-L for AO basis
+    Carlson and Keller, Phys. Rev. 105, 102 (1957) — Lowdin optimality
+    """
+    from scipy.linalg import qr
+    from scipy.special import erfc as sp_erfc
+
+    num_kpoints = len(eigenvectors_list)
+    num_orbitals = eigenvectors_list[0].shape[0]
+
+    if band_indices is None:
+        num_bands = eigenvectors_list[0].shape[1]
+        band_indices = np.arange(num_bands)
+
+    # Set occupation function parameters
+    if mu is None:
+        mu = e_fermi
+    if sigma is None:
+        # Auto-determine sigma from band gap or default
+        all_evals = np.concatenate([ev[band_indices] for ev in eigenvalues_list])
+        # Find approximate gap near E_F
+        below = all_evals[all_evals <= e_fermi]
+        above = all_evals[all_evals > e_fermi]
+        if len(below) > 0 and len(above) > 0:
+            gap = np.min(above) - np.max(below)
+            sigma = max(gap, 1.0)
+        else:
+            sigma = 1.0
+
+    if verbose:
+        print(f"\n  SCDM-L projection selection:")
+        print(f"    Occupation function: {method}")
+        print(f"    mu = {mu:.4f} eV, sigma = {sigma:.4f} eV")
+        print(f"    Number of bands considered: {len(band_indices)}")
+        print(f"    Target num_wann: {num_wann}")
+
+    # Accumulate k-averaged Lowdin density matrix
+    P_L = np.zeros((num_orbitals, num_orbitals), dtype=complex)
+
+    for ik in range(num_kpoints):
+        C_k = eigenvectors_list[ik][:, band_indices]
+        S_k = S_k_list[ik]
+        evals = eigenvalues_list[ik][band_indices]
+
+        # Compute occupation weights
+        if method == 'erfc':
+            f_occ = 0.5 * sp_erfc((evals - mu) / sigma)
+        elif method == 'gaussian':
+            f_occ = np.exp(-((evals - mu) / sigma) ** 2)
+        elif method == 'isolated':
+            f_occ = np.ones_like(evals)
+        else:
+            raise ValueError(f"Unknown occupation method: {method}")
+
+        # Compute S(k)^{1/2} via eigendecomposition
+        eigvals_s, eigvecs_s = np.linalg.eigh(S_k)
+        # Clamp small/negative eigenvalues for numerical stability
+        eigvals_s = np.maximum(eigvals_s, 1e-12)
+        S_sqrt = eigvecs_s @ np.diag(np.sqrt(eigvals_s)) @ eigvecs_s.conj().T
+
+        # Weighted density matrix: P(k) = C(k) diag(f) C(k)^dag
+        P_k = C_k @ np.diag(f_occ) @ C_k.conj().T
+
+        # Lowdin transform: P_L(k) = S^{1/2}(k) P(k) S^{1/2}(k)
+        P_L += S_sqrt @ P_k @ S_sqrt
+
+    P_L /= num_kpoints
+
+    # Apply orbital_mask: zero out columns/rows for excluded orbitals
+    # This forces QR column pivoting to rank masked-out orbitals last
+    if orbital_mask is not None:
+        orbital_mask = np.asarray(orbital_mask, dtype=bool)
+        if len(orbital_mask) != num_orbitals:
+            raise ValueError(
+                f"orbital_mask length ({len(orbital_mask)}) != "
+                f"num_orbitals ({num_orbitals})"
+            )
+        excluded = ~orbital_mask
+        P_L[excluded, :] = 0.0
+        P_L[:, excluded] = 0.0
+        n_allowed = np.sum(orbital_mask)
+        if verbose:
+            print(f"    Orbital mask: {n_allowed}/{num_orbitals} orbitals allowed")
+        if n_allowed < num_wann:
+            raise ValueError(
+                f"orbital_mask allows only {n_allowed} orbitals but "
+                f"num_wann={num_wann} requested"
+            )
+
+    # Apply QR with column pivoting (QRCP)
+    # P_L is Hermitian, so columns = rows in terms of importance
+    Q, R, piv = qr(P_L, pivoting=True)
+
+    # The first num_wann pivots are the most important orbital indices
+    selected_indices = np.sort(piv[:num_wann])
+
+    # Compute diagnostic weights from R diagonal (measures column importance)
+    R_diag = np.abs(np.diag(R))
+    # Map pivot-ordered weights back to original orbital ordering
+    orbital_weights = np.zeros(num_orbitals)
+    for i, p in enumerate(piv):
+        if i < len(R_diag):
+            orbital_weights[p] = R_diag[i]
+    # Normalize
+    max_weight = np.max(orbital_weights) if np.max(orbital_weights) > 0 else 1.0
+    orbital_weights /= max_weight
+
+    if verbose:
+        print(f"    Selected orbital indices: {selected_indices}")
+        # Show top contributors
+        top_indices = piv[:min(5, num_wann)]
+        print(f"    Top {len(top_indices)} SCDM pivots (by importance):")
+        for rank, idx in enumerate(top_indices):
+            print(f"      Rank {rank}: orbital {idx}, |R_diag| = {R_diag[rank]:.6f}")
+
+        # Show occupation weight statistics
+        all_evals_sel = np.concatenate([ev[band_indices] for ev in eigenvalues_list])
+        if method == 'erfc':
+            all_f = 0.5 * sp_erfc((all_evals_sel - mu) / sigma)
+        elif method == 'gaussian':
+            all_f = np.exp(-((all_evals_sel - mu) / sigma) ** 2)
+        else:
+            all_f = np.ones_like(all_evals_sel)
+        print(f"    Occupation weights: min={np.min(all_f):.4f}, max={np.max(all_f):.4f}, "
+              f"mean={np.mean(all_f):.4f}")
+
+    return OrbitalSelectionResult(
+        selected_indices=selected_indices,
+        orbital_weights=orbital_weights,
+        num_selected=num_wann,
+    )
+
+
 def suggest_optimal_window(
     eigenvalues_list: List[np.ndarray],
     e_fermi: float,

@@ -166,7 +166,7 @@ def analyze_band_ranges_from_eig(eig_file: str, fermi_energy: float = 0.0):
 def analyze_band_ranges_full(input_file: str, k_grid: Optional[Tuple[int, int, int]] = None,
                              fermi_energy: Optional[float] = None, num_electrons: Optional[int] = None,
                              parallel: bool = True, verbose: bool = False,
-                             analyze_character: bool = True, num_bands_to_analyze: int = 20):
+                             analyze_character: bool = True, num_bands_to_analyze: int = 40):
     """
     Full band range analysis from CRYSTAL output (with eigenvectors for orbital character).
 
@@ -499,8 +499,8 @@ Examples:
                        help='Output format (default: txt)')
     parser.add_argument('--no-character', action='store_true',
                        help='Skip orbital character analysis')
-    parser.add_argument('--num-bands-analyze', type=int, default=20,
-                       help='Number of bands to analyze for character (default: 20)')
+    parser.add_argument('--num-bands-analyze', type=int, default=40,
+                       help='Number of bands to analyze for character (default: 40)')
 
     args = parser.parse_args()
 

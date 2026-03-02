@@ -37,15 +37,18 @@ def generate_kpoint_grid(k_grid: Tuple[int, int, int]) -> np.ndarray:
     """
     nk1, nk2, nk3 = k_grid
     kpoints = []
-    
-    for i in range(nk1):
+
+    # Loop order matches Wannier90: k3 varies fastest, then k2, then k1
+    # For 2D systems (nk3=1), this means k1 varies fastest
+    # This matches the ordering in the .nnkp file
+    for k in range(nk3):
         for j in range(nk2):
-            for k in range(nk3):
+            for i in range(nk1):
                 kx = i / nk1
                 ky = j / nk2
                 kz = k / nk3
                 kpoints.append([kx, ky, kz])
-    
+
     return np.array(kpoints)
 
 
