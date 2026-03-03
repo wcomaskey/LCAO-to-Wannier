@@ -9,7 +9,122 @@ NOTE: This uses the standard 2π convention which ensures proper BZ periodicity:
 """
 
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+
+
+class StackedMatrices:
+    """Pre-stacked real-space matrices for vectorized Fourier assembly.
+
+    Converts the dict-based R-space storage into contiguous numpy arrays,
+    eliminating per-k-point dict iteration, tuple-to-array conversion, and
+    scalar-matrix multiply overhead.
+
+    Attributes
+    ----------
+    R_vectors : ndarray of shape (num_R, 3)
+        R-vectors in integer lattice coordinates
+    H_stack : ndarray of shape (num_R, N, N)
+        Stacked Hamiltonian matrices H(R)
+    S_stack : ndarray of shape (num_R, N, N)
+        Stacked overlap matrices S(R)
+    num_orbitals : int
+        Number of orbitals (N)
+    num_R : int
+        Number of R-vectors
+    """
+    __slots__ = ('R_vectors', 'H_stack', 'S_stack', 'num_orbitals', 'num_R')
+
+    def __init__(self, R_vectors, H_stack, S_stack, num_orbitals, num_R):
+        self.R_vectors = R_vectors
+        self.H_stack = H_stack
+        self.S_stack = S_stack
+        self.num_orbitals = num_orbitals
+        self.num_R = num_R
+
+
+def stack_real_space_matrices(
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]]
+) -> StackedMatrices:
+    """Convert dict-based R-space matrices to contiguous stacked arrays.
+
+    Parameters
+    ----------
+    real_space_matrices : dict
+        Maps (R1, R2, R3) -> {'H': H_matrix, 'S': S_matrix}
+
+    Returns
+    -------
+    stacked : StackedMatrices
+        Pre-stacked arrays ready for vectorized Fourier assembly
+    """
+    R_keys = list(real_space_matrices.keys())
+    R_vectors = np.array(R_keys, dtype=np.float64)
+    H_stack = np.array([real_space_matrices[k]['H'] for k in R_keys])
+    S_stack = np.array([real_space_matrices[k]['S'] for k in R_keys])
+    N = H_stack.shape[1]
+    return StackedMatrices(R_vectors, H_stack, S_stack, N, len(R_keys))
+
+
+def fourier_transform_vectorized(
+    k_point: np.ndarray,
+    stacked: StackedMatrices
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized Fourier assembly for a single k-point.
+
+    Replaces the Python for-loop over R-vectors with np.tensordot,
+    dispatching to BLAS for the weighted sum.
+
+    Parameters
+    ----------
+    k_point : ndarray of shape (3,)
+        k-point in fractional coordinates
+    stacked : StackedMatrices
+        Pre-stacked R-space matrices
+
+    Returns
+    -------
+    H_k, S_k : ndarray of shape (N, N)
+        Hamiltonian and overlap in k-space
+    """
+    phases = np.exp(2j * np.pi * stacked.R_vectors @ k_point)
+    H_k = np.tensordot(phases, stacked.H_stack, axes=([0], [0]))
+    S_k = np.tensordot(phases, stacked.S_stack, axes=([0], [0]))
+    return H_k, S_k
+
+
+def fourier_all_kpoints(
+    k_points: np.ndarray,
+    stacked: StackedMatrices,
+    S_only: bool = False
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    """Batch Fourier assembly for ALL k-points in one call.
+
+    Computes phases for all k-points at once via matrix multiply,
+    then uses np.einsum to sum over R-vectors — a single BLAS call.
+
+    Parameters
+    ----------
+    k_points : ndarray of shape (K, 3)
+        All k-points in fractional coordinates
+    stacked : StackedMatrices
+        Pre-stacked R-space matrices
+    S_only : bool
+        If True, only compute S(k) (for MMN midpoint evaluation)
+
+    Returns
+    -------
+    H_all : ndarray of shape (K, N, N) or None if S_only
+        Hamiltonian at all k-points
+    S_all : ndarray of shape (K, N, N)
+        Overlap matrix at all k-points
+    """
+    # phases: (K, R) — one matrix multiply
+    phases = np.exp(2j * np.pi * k_points @ stacked.R_vectors.T)
+    S_all = np.einsum('kr,rij->kij', phases, stacked.S_stack, optimize=True)
+    if S_only:
+        return None, S_all
+    H_all = np.einsum('kr,rij->kij', phases, stacked.H_stack, optimize=True)
+    return H_all, S_all
 
 
 def fourier_transform_to_kspace(
@@ -43,19 +158,6 @@ def fourier_transform_to_kspace(
         Hamiltonian in k-space, shape (num_orbitals, num_orbitals)
     S_k : ndarray
         Overlap matrix in k-space, shape (num_orbitals, num_orbitals)
-
-    Notes
-    -----
-    The phase factor is computed as exp(i 2π k·R) where k is in fractional
-    coordinates and R is in integer lattice coordinates.
-
-    The 2π convention ensures that exp(i 2π G·R) = 1 for integer G and R,
-    which gives proper Brillouin zone periodicity H(k+G) = H(k).
-
-    Examples
-    --------
-    >>> k = np.array([0.25, 0.25, 0.25])
-    >>> H_k, S_k = fourier_transform_to_kspace(k, real_space_matrices, lattice_vectors)
     """
     # Get matrix dimensions from first entry
     first_key = next(iter(real_space_matrices))
@@ -158,16 +260,5 @@ def compute_phase_factors(
     phase_factors : ndarray of shape (num_kpoints, num_R_vectors)
         Pre-computed phase factors using 2π convention
     """
-    num_kpoints = len(k_points)
-    num_R = len(R_vectors)
-    phase_factors = np.zeros((num_kpoints, num_R), dtype=np.complex128)
-
-    for k_idx, k_point in enumerate(k_points):
-        for R_idx, R_tuple in enumerate(R_vectors):
-            R = np.array(R_tuple)
-            # Using 2π convention for proper BZ periodicity
-            phase_factors[k_idx, R_idx] = np.exp(2j * np.pi * np.dot(k_point, R))
-
-    return phase_factors
-
-
+    R_arr = np.array(R_vectors, dtype=np.float64)
+    return np.exp(2j * np.pi * k_points @ R_arr.T)

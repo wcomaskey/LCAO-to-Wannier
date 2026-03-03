@@ -10,7 +10,14 @@ from typing import Dict, Tuple, Optional, List
 import warnings
 
 from .kpoints import generate_kpoint_grid, generate_neighbor_list
-from .solver import solve_all_kpoints_sequential, solve_all_kpoints_parallel
+from .solver import (
+    solve_all_kpoints_sequential,
+    solve_all_kpoints_parallel,
+    solve_all_kpoints_batched,
+    solve_all_kpoints_auto,
+    HAS_FORTRAN,
+)
+from .fourier import stack_real_space_matrices
 from .wannier90 import write_wannier90_files
 from .verification import run_all_verifications
 from .utils import check_matrix_consistency, print_calculation_info
@@ -216,6 +223,12 @@ class Wannier90Engine:
         self._dis_win = None             # (dis_win_min, dis_win_max) relative to E_F
         self._dis_froz = None            # (dis_froz_min, dis_froz_max) relative to E_F
 
+        # Pre-stack R-space matrices for vectorized Fourier assembly
+        self._stacked = stack_real_space_matrices(real_space_matrices)
+
+        # Conditioning validation result (set by solve_all_kpoints)
+        self._conditioning_result = None
+
         # Print initialization info
         self._print_init_info()
     
@@ -250,14 +263,17 @@ class Wannier90Engine:
         self,
         parallel: bool = True,
         num_processes: Optional[int] = None,
-        convert_to_eV: bool = True
+        convert_to_eV: bool = True,
+        backend: str = 'auto',
+        validate_overlap: bool = True,
+        overlap_strict: bool = True
     ) -> None:
         """
         Solve the generalized eigenvalue problem for all k-points.
-        
+
         This solves for ALL bands initially. Band selection is applied
         later in analyze_bands() or write_files().
-        
+
         Parameters
         ----------
         parallel : bool, optional
@@ -268,16 +284,59 @@ class Wannier90Engine:
         convert_to_eV : bool, optional
             Convert eigenvalues from Hartree to eV (default: True)
             Set to False if your Fock matrix is already in eV
+        backend : str, optional
+            Eigensolve backend: 'auto' (Fortran if available, else Python),
+            'fortran', or 'python' (default: 'auto')
+        validate_overlap : bool, optional
+            Run overlap matrix conditioning check before eigensolving
+            (default: True)
+        overlap_strict : bool, optional
+            If True, abort on badly-conditioned overlap matrices
+            (default: True)
         """
         print(f"\n{'=' * 70}")
         print(f"Solving Eigenvalue Problems at {self.num_kpoints} K-Points")
         print(f"{'=' * 70}")
-        
+
+        # Pre-solve overlap conditioning check
+        if validate_overlap and self._stacked is not None:
+            from .conditioning import (
+                validate_overlap_conditioning,
+                OverlapConditioningError,
+            )
+            try:
+                self._conditioning_result = validate_overlap_conditioning(
+                    self._stacked,
+                    k_grid=self.k_grid,
+                    verbose=True,
+                    strict=overlap_strict,
+                )
+            except OverlapConditioningError:
+                print("\nAborting: fix the R-vector count and re-run.")
+                raise
+
         # Always solve for all orbitals first
         solve_num_bands = self.num_orbitals
-        
-        if parallel and self.num_kpoints > 1:
-            print(f"Mode: Parallel")
+
+        # Determine which backend to use
+        use_auto = (backend == 'auto' and HAS_FORTRAN) or backend == 'fortran'
+
+        if use_auto or (not parallel):
+            # Use auto dispatch (Fortran+OpenMP if available, else batched Python)
+            backend_name = "Fortran+OpenMP" if (HAS_FORTRAN and backend != 'python') else "Batched vectorized"
+            print(f"Mode: {backend_name}")
+            eig_list, evec_list, sk_list = solve_all_kpoints_auto(
+                self.kpoints,
+                self._stacked,
+                solve_num_bands,
+                backend=backend
+            )
+            self.eigenvalues_list = eig_list
+            self.eigenvectors_list = evec_list
+            self.H_k_list = []  # Not stored in batched/Fortran mode
+            self.S_k_list = sk_list
+        elif parallel and self.num_kpoints > 1:
+            print(f"Mode: Parallel (multiprocessing)")
             results = solve_all_kpoints_parallel(
                 self.kpoints,
                 self.real_space_matrices,
@@ -285,17 +344,18 @@ class Wannier90Engine:
                 solve_num_bands,
                 num_processes
             )
+            self.eigenvalues_list, self.eigenvectors_list, self.H_k_list, self.S_k_list = results
         else:
-            print(f"Mode: Sequential")
-            results = solve_all_kpoints_sequential(
+            print(f"Mode: Batched vectorized")
+            eig_list, evec_list, sk_list = solve_all_kpoints_batched(
                 self.kpoints,
-                self.real_space_matrices,
-                self.lattice_vectors,
+                self._stacked,
                 solve_num_bands
             )
-        
-        # Unpack results
-        self.eigenvalues_list, self.eigenvectors_list, self.H_k_list, self.S_k_list = results
+            self.eigenvalues_list = eig_list
+            self.eigenvectors_list = evec_list
+            self.H_k_list = []  # Not stored in batched mode
+            self.S_k_list = sk_list
         
         # Convert eigenvalues from Hartree to eV
         if convert_to_eV:
@@ -571,10 +631,19 @@ class Wannier90Engine:
             eigenvectors_to_verify = self.eigenvectors_list
             num_bands_to_verify = self.num_wann
         
+        # If H_k_list is empty (batched mode), recompute for verification
+        H_k_for_verify = self.H_k_list
+        if not H_k_for_verify and self._stacked is not None:
+            from .fourier import fourier_transform_vectorized
+            H_k_for_verify = []
+            for k_idx in range(len(self.kpoints)):
+                H_k, _ = fourier_transform_vectorized(self.kpoints[k_idx], self._stacked)
+                H_k_for_verify.append(H_k)
+
         results = run_all_verifications(
             eigenvalues_to_verify,
             eigenvectors_to_verify,
-            self.H_k_list,
+            H_k_for_verify,
             self.S_k_list,
             num_bands_to_verify,
             verbose=True
@@ -800,7 +869,8 @@ class Wannier90Engine:
                 len(band_indices),
                 convention='pi',
                 use_direct_method=True,  # Use new direct real-space method
-                verbose=verbose
+                verbose=verbose,
+                stacked=self._stacked
             )
         else:
             # Fallback to standard MMN writer (no phase correction)

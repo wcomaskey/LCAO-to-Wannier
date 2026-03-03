@@ -66,8 +66,12 @@ from .kpoints import (
 # Fourier transform functions
 from .fourier import (
     fourier_transform_to_kspace,
+    fourier_transform_vectorized,
+    fourier_all_kpoints,
     inverse_fourier_transform,
     compute_phase_factors,
+    StackedMatrices,
+    stack_real_space_matrices,
 )
 
 # Solver functions
@@ -76,6 +80,7 @@ from .solver import (
     solve_kpoint,
     solve_all_kpoints_sequential,
     solve_all_kpoints_parallel,
+    solve_all_kpoints_batched,
 )
 
 # Verification functions
@@ -151,6 +156,13 @@ from .symmetry import (
     get_orbital_rotation,
     SymmetryOperation,
     SymmetryInfo,
+)
+
+# Conditioning validation
+from .conditioning import (
+    validate_overlap_conditioning,
+    OverlapConditioningResult,
+    OverlapConditioningError,
 )
 
 # Irrep module
@@ -267,6 +279,11 @@ __all__ = [
     'get_orbital_rotation',
     'SymmetryOperation',
     'SymmetryInfo',
+
+    # Conditioning
+    'validate_overlap_conditioning',
+    'OverlapConditioningResult',
+    'OverlapConditioningError',
 
     # Irreps
     'compute_little_group',

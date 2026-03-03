@@ -8,7 +8,7 @@ This module contains functions for writing Wannier90 input files
 import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 
-from .fourier import fourier_transform_to_kspace
+from .fourier import fourier_transform_to_kspace, fourier_transform_vectorized, StackedMatrices
 
 
 def diagnose_mmn_matrix(
@@ -95,7 +95,8 @@ def compute_mmn_direct(
     basis_atom_map: np.ndarray,
     eigenvectors: List[np.ndarray],
     symmetrize: bool = True,
-    G_shift: np.ndarray = None
+    G_shift: np.ndarray = None,
+    stacked: 'StackedMatrices' = None
 ) -> np.ndarray:
     """
     Compute M_mn using the Symmetric Midpoint Approximation.
@@ -163,9 +164,12 @@ def compute_mmn_direct(
         print(f"  b_frac = k_next + G_shift - k_curr = {b_frac}")
         print(f"  k_mid = k_curr + 0.5*b_frac = {k_mid}")
 
-    # Compute S at the midpoint using fourier_transform_to_kspace
+    # Compute S at the midpoint
     # With 2π convention, S(k_mid) = S(k_mid + G) for any G, so no correction needed
-    _, S_mid = fourier_transform_to_kspace(k_mid, real_space_matrices, lattice_vectors)
+    if stacked is not None:
+        _, S_mid = fourier_transform_vectorized(k_mid, stacked)
+    else:
+        _, S_mid = fourier_transform_to_kspace(k_mid, real_space_matrices, lattice_vectors)
 
     # Project onto eigenvectors
     C_k = eigenvectors[k_idx]
@@ -481,7 +485,8 @@ def write_mmn_file_lcao(
     num_wann: int,
     convention: str = 'pi',
     use_direct_method: bool = True,
-    verbose: bool = False
+    verbose: bool = False,
+    stacked: 'StackedMatrices' = None
 ) -> None:
     """
     Write the .mmn file for LCAO methods.
@@ -558,7 +563,8 @@ def write_mmn_file_lcao(
                         real_space_matrices, lattice_vectors,
                         atom_positions, basis_atom_map, eigenvectors_list,
                         symmetrize=True,
-                        G_shift=G_shift  # Pass G_shift for correct b-vector computation
+                        G_shift=G_shift,
+                        stacked=stacked
                     )
                 else:
                     M_kb = compute_mmn_matrix(

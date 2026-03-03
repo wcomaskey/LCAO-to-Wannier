@@ -3,12 +3,27 @@ Eigenvalue Solver Module
 
 This module contains functions for solving the generalized eigenvalue problem
 H(k) C(k) = S(k) C(k) E(k) at each k-point.
+
+Supports three backends:
+- Sequential: Python loop over k-points (dict-based Fourier)
+- Batched: Vectorized Fourier (einsum) + Python eigensolve loop
+- Fortran: Combined Fourier+eigensolve in Fortran with OpenMP parallelism
 """
 
 import numpy as np
 from scipy.linalg import eigh
-from typing import Tuple, Dict
-from .fourier import fourier_transform_to_kspace
+from typing import Tuple, Dict, Optional
+from .fourier import (
+    fourier_transform_to_kspace,
+    fourier_all_kpoints,
+    StackedMatrices,
+)
+
+# Try to import Fortran kernel
+try:
+    from .fortran import HAS_FORTRAN, solve_all_kpoints_fortran
+except ImportError:
+    HAS_FORTRAN = False
 
 
 def solve_generalized_eigenvalue_problem(
@@ -22,8 +37,7 @@ def solve_generalized_eigenvalue_problem(
 
     Uses scipy.linalg.eigh for Hermitian matrices, which is more stable
     and efficient than the general eigenvalue solver. Falls back to
-    Löwdin orthogonalization when the overlap matrix is near-singular
-    (common with large basis sets or highly contracted shells).
+    S regularization when the overlap matrix is near-singular.
 
     Parameters
     ----------
@@ -35,8 +49,7 @@ def solve_generalized_eigenvalue_problem(
         Number of lowest eigenvalues/eigenvectors to keep
         If None, keeps all
     overlap_threshold : float
-        Eigenvalues of S below this threshold are discarded
-        (removes near-linear dependencies in the basis)
+        Eigenvalues of S below this threshold trigger regularization
 
     Returns
     -------
@@ -44,46 +57,26 @@ def solve_generalized_eigenvalue_problem(
         Eigenvalues sorted in ascending order
     eigenvectors : ndarray of shape (num_orbitals, num_wann)
         Eigenvectors (columns), normalized such that C† S C = I
-
-    Notes
-    -----
-    The generalized eigenvalue problem is:
-        H(k) C(k) = S(k) C(k) E(k)
-
-    scipy.linalg.eigh automatically sorts eigenvalues in ascending order
-    and normalizes eigenvectors according to C† S C = I.
-
-    When S is near-singular, we use Löwdin orthogonalization:
-    1. Diagonalize S = U s U†
-    2. Discard eigenvectors with s < threshold
-    3. Form X = U s^{-1/2} in the reduced space
-    4. Solve X† H X c = e c (standard eigenvalue problem)
-    5. Back-transform: C = X c
     """
     try:
         eigenvalues, eigenvectors = eigh(H_k, S_k)
     except np.linalg.LinAlgError:
-        # Overlap matrix is not positive definite — use Löwdin orthogonalization
+        # Overlap matrix is not positive definite — regularize it.
+        # Adding a small shift eps*I to S makes it positive definite while
+        # preserving the full basis dimension. High-energy eigenvalues from
+        # regularized near-null-space directions will have degraded
+        # projectability and get filtered downstream.
         s_evals, U = eigh(S_k)
+        s_min = np.min(s_evals)
 
-        # Keep only basis functions with significant overlap eigenvalues
-        mask = s_evals > overlap_threshold
-        n_kept = np.sum(mask)
-
-        s_kept = s_evals[mask]
-        U_kept = U[:, mask]
-
-        # Löwdin transformation matrix: X = U s^{-1/2}
-        X = U_kept * (1.0 / np.sqrt(s_kept))[np.newaxis, :]
-
-        # Transform to orthonormal basis: H_orth = X† H X
-        H_orth = X.conj().T @ H_k @ X
-
-        # Solve standard eigenvalue problem
-        eigenvalues, c = eigh(H_orth)
-
-        # Back-transform eigenvectors to original basis
-        eigenvectors = X @ c
+        # Shift S so its smallest eigenvalue equals overlap_threshold
+        if s_min < overlap_threshold:
+            shift = overlap_threshold - s_min
+            S_reg = S_k + shift * np.eye(S_k.shape[0])
+            eigenvalues, eigenvectors = eigh(H_k, S_reg)
+        else:
+            # S is actually positive definite; retry (shouldn't happen)
+            eigenvalues, eigenvectors = eigh(H_k, S_k)
 
     # Keep only the lowest num_wann eigenvalues and eigenvectors
     if num_wann is not None:
@@ -102,9 +95,9 @@ def solve_kpoint(
 ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Solve the generalized eigenvalue problem for a single k-point.
-    
+
     This function is designed to be easily parallelizable.
-    
+
     Parameters
     ----------
     k_idx : int
@@ -117,7 +110,7 @@ def solve_kpoint(
         Real-space lattice vectors
     num_wann : int
         Number of Wannier functions (bands to keep)
-    
+
     Returns
     -------
     k_idx : int
@@ -133,11 +126,61 @@ def solve_kpoint(
     """
     # Fourier transform to k-space
     H_k, S_k = fourier_transform_to_kspace(k_point, real_space_matrices, lattice_vectors)
-    
+
     # Solve generalized eigenvalue problem
     eigenvalues, eigenvectors = solve_generalized_eigenvalue_problem(H_k, S_k, num_wann)
-    
+
     return k_idx, eigenvalues, eigenvectors, H_k, S_k
+
+
+def solve_all_kpoints_batched(
+    k_points: np.ndarray,
+    stacked: StackedMatrices,
+    num_wann: int
+) -> Tuple[list, list, list]:
+    """
+    Solve eigenvalue problems using batch Fourier assembly.
+
+    Assembles H(k) and S(k) for ALL k-points in one vectorized call,
+    then loops only over eigensolves. Eliminates per-k-point Python
+    overhead for the Fourier step.
+
+    Parameters
+    ----------
+    k_points : ndarray of shape (num_kpoints, 3)
+        All k-points in fractional coordinates
+    stacked : StackedMatrices
+        Pre-stacked R-space matrices
+    num_wann : int
+        Number of bands to solve for
+
+    Returns
+    -------
+    eigenvalues_list : list of ndarrays
+        Eigenvalues for each k-point
+    eigenvectors_list : list of ndarrays
+        Eigenvectors for each k-point
+    S_k_list : list of ndarrays
+        Overlap matrices for each k-point (needed for AMN/projectability)
+    """
+    K = len(k_points)
+
+    # Batch Fourier assembly — single BLAS call for all k-points
+    H_all, S_all = fourier_all_kpoints(k_points, stacked)
+
+    eigenvalues_list = []
+    eigenvectors_list = []
+    S_k_list = []
+
+    for k_idx in range(K):
+        eigenvalues, eigenvectors = solve_generalized_eigenvalue_problem(
+            H_all[k_idx], S_all[k_idx], num_wann
+        )
+        eigenvalues_list.append(eigenvalues)
+        eigenvectors_list.append(eigenvectors)
+        S_k_list.append(S_all[k_idx])
+
+    return eigenvalues_list, eigenvectors_list, S_k_list
 
 
 def solve_all_kpoints_sequential(
@@ -148,7 +191,7 @@ def solve_all_kpoints_sequential(
 ) -> Tuple[list, list, list, list]:
     """
     Solve eigenvalue problems at all k-points sequentially.
-    
+
     Parameters
     ----------
     k_points : ndarray of shape (num_kpoints, 3)
@@ -159,7 +202,7 @@ def solve_all_kpoints_sequential(
         Real-space lattice vectors
     num_wann : int
         Number of Wannier functions
-    
+
     Returns
     -------
     eigenvalues_list : list of ndarrays
@@ -175,7 +218,7 @@ def solve_all_kpoints_sequential(
     eigenvectors_list = []
     H_k_list = []
     S_k_list = []
-    
+
     for k_idx in range(len(k_points)):
         k_point = k_points[k_idx]
         _, eigenvalues, eigenvectors, H_k, S_k = solve_kpoint(
@@ -185,7 +228,7 @@ def solve_all_kpoints_sequential(
         eigenvectors_list.append(eigenvectors)
         H_k_list.append(H_k)
         S_k_list.append(S_k)
-    
+
     return eigenvalues_list, eigenvectors_list, H_k_list, S_k_list
 
 
@@ -198,7 +241,7 @@ def solve_all_kpoints_parallel(
 ) -> Tuple[list, list, list, list]:
     """
     Solve eigenvalue problems at all k-points in parallel.
-    
+
     Parameters
     ----------
     k_points : ndarray of shape (num_kpoints, 3)
@@ -211,7 +254,7 @@ def solve_all_kpoints_parallel(
         Number of Wannier functions
     num_processes : int, optional
         Number of parallel processes (default: use all CPUs)
-    
+
     Returns
     -------
     eigenvalues_list : list of ndarrays
@@ -225,11 +268,11 @@ def solve_all_kpoints_parallel(
     """
     import multiprocessing as mp
     from functools import partial
-    
+
     if num_processes is None:
         # Use at most half the CPUs to avoid saturating the system
         num_processes = min(max(1, mp.cpu_count() // 2), len(k_points))
-    
+
     # Create partial function with fixed parameters
     solve_func = partial(
         solve_kpoint,
@@ -237,21 +280,77 @@ def solve_all_kpoints_parallel(
         lattice_vectors=lattice_vectors,
         num_wann=num_wann
     )
-    
+
     # Prepare arguments
     args = [(k_idx, k_points[k_idx]) for k_idx in range(len(k_points))]
-    
+
     # Run parallel computation
     with mp.Pool(processes=num_processes) as pool:
         results = pool.starmap(solve_func, args)
-    
+
     # Sort results by k_idx
     results.sort(key=lambda x: x[0])
-    
+
     # Extract results
     eigenvalues_list = [r[1] for r in results]
     eigenvectors_list = [r[2] for r in results]
     H_k_list = [r[3] for r in results]
     S_k_list = [r[4] for r in results]
-    
+
     return eigenvalues_list, eigenvectors_list, H_k_list, S_k_list
+
+
+def solve_all_kpoints_auto(
+    k_points: np.ndarray,
+    stacked: StackedMatrices,
+    num_wann: int,
+    backend: str = 'auto'
+) -> Tuple[list, list, list]:
+    """
+    Solve eigenvalue problems at all k-points using the best available backend.
+
+    Automatically selects between Fortran (OpenMP) and Python (batched vectorized)
+    based on availability.
+
+    Parameters
+    ----------
+    k_points : ndarray of shape (num_kpoints, 3)
+        All k-points in fractional coordinates
+    stacked : StackedMatrices
+        Pre-stacked R-space matrices
+    num_wann : int
+        Number of bands to solve for
+    backend : str
+        'auto' - Use Fortran if available, else Python batched
+        'fortran' - Force Fortran backend (error if not compiled)
+        'python' - Force Python batched backend
+
+    Returns
+    -------
+    eigenvalues_list : list of ndarrays
+        Eigenvalues for each k-point
+    eigenvectors_list : list of ndarrays
+        Eigenvectors for each k-point
+    S_k_list : list of ndarrays
+        Overlap matrices for each k-point
+    """
+    use_fortran = False
+
+    if backend == 'auto':
+        use_fortran = HAS_FORTRAN
+    elif backend == 'fortran':
+        if not HAS_FORTRAN:
+            raise RuntimeError(
+                "Fortran backend requested but not compiled. "
+                "Run: python3 lcao_wannier/fortran/build_ext.py"
+            )
+        use_fortran = True
+    elif backend == 'python':
+        use_fortran = False
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}. Use 'auto', 'fortran', or 'python'.")
+
+    if use_fortran:
+        return solve_all_kpoints_fortran(k_points, stacked, num_wann)
+    else:
+        return solve_all_kpoints_batched(k_points, stacked, num_wann)

@@ -32,7 +32,7 @@ spin_channel_pattern = re.compile(
 spin_simple_pattern = re.compile(
     r'^\s*(ALPHA|BETA)\s+ELECTRONS', re.IGNORECASE
 )
-column_indices_pattern = re.compile(r'^\s*(\d+\s+)+\d+\s*$')
+column_indices_pattern = re.compile(r'^\s*\d+(\s+\d+)*\s*$')
 data_line_pattern = re.compile(r'^\s*(\d+)\s+(.+)$')
 float_pattern = re.compile(
     r'[-+]?\d*\.\d+(?:[eEdD][-+]?\d+)?|[-+]?\d+(?:[eEdD][-+]?\d+)?'

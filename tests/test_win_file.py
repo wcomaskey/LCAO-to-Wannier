@@ -425,8 +425,8 @@ class TestAtomParsing:
         atoms, lattice = parse_atoms_from_crystal_output(lines)
 
         assert len(atoms) == 2
-        assert atoms[0][0] == 'SI'
-        assert atoms[1][0] == 'SI'
+        assert atoms[0][0] == 'Si'
+        assert atoms[1][0] == 'Si'
         assert lattice.shape == (3, 3)
         assert np.allclose(lattice, np.eye(3) * 5.0)
 
