@@ -94,17 +94,31 @@ def test_neighbor_list_generation():
                 f"Invalid neighbor index: {neighbor_idx}"
             assert len(b_vec) == 3, f"b-vector should be 3D, got {len(b_vec)}"
     
-    # Test specific case: corner k-point should wrap around
+    # Test specific case: corner k-point (0,0,0) should wrap for -x, -y, -z
     corner_idx = 0
     corner_neighbors = neighbor_list[corner_idx]
-    
-    # Check that b-vectors are unit vectors in ±x, ±y, ±z
-    b_vecs = [b for _, b in corner_neighbors]
-    b_norms = [np.linalg.norm(b) for b in b_vecs]
-    
-    # All b-vectors should be unit vectors (within numerical precision)
-    for norm in b_norms:
-        assert np.isclose(norm, 1.0), f"b-vector norm {norm} not unity"
+
+    # G_shift follows Wannier90 convention: 0 for interior, ±1 at BZ boundary
+    G_vecs = [G for _, G in corner_neighbors]
+
+    # For corner (0,0,0) in 3x3x3: +x,+y,+z are interior (G=0),
+    # -x,-y,-z wrap around (G=-1)
+    num_zero_G = sum(1 for G in G_vecs if np.all(G == 0))
+    num_nonzero_G = sum(1 for G in G_vecs if np.any(G != 0))
+    assert num_zero_G == 3, f"Expected 3 interior neighbors (G=0), got {num_zero_G}"
+    assert num_nonzero_G == 3, f"Expected 3 BZ-boundary neighbors (G≠0), got {num_nonzero_G}"
+
+    # Non-zero G_shifts should be unit vectors in -x, -y, -z
+    nonzero_Gs = sorted([tuple(G) for G in G_vecs if np.any(G != 0)])
+    expected = sorted([(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
+    assert nonzero_Gs == expected, f"Expected G_shifts {expected}, got {nonzero_Gs}"
+
+    # Test interior k-point: all G_shifts should be (0,0,0) for a 3x3x3 grid
+    # Interior k-point (1,1,1) has index 1*9 + 1*3 + 1 = 13
+    interior_idx = 13
+    interior_Gs = [G for _, G in neighbor_list[interior_idx]]
+    assert all(np.all(G == 0) for G in interior_Gs), \
+        f"Interior k-point should have all G_shifts = 0"
     
     print(f"  Generated neighbor list for {k_grid} grid")
     print(f"  Each k-point has {len(corner_neighbors)} neighbors")

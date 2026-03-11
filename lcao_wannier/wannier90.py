@@ -84,6 +84,199 @@ def diagnose_mmn_matrix(
     }
 
 
+def compute_mmn_lowdin(
+    k_idx: int,
+    next_k_idx: int,
+    C_tilde_list: List[np.ndarray],
+    b_cart: np.ndarray = None,
+    atom_positions: np.ndarray = None,
+    basis_atom_map: np.ndarray = None,
+    berry_phase: bool = True,
+) -> np.ndarray:
+    """
+    Compute M_mn using the Lowdin orthogonalization approach.
+
+    The Lowdin transformation orthogonalizes the eigenvectors for numerical
+    stability. When berry_phase=True (default), the Berry phase
+    exp(-i b_cart . tau_mu) encodes the position operator e^{-ib.r} that
+    carries intra-cell atomic position information. Both are essential:
+    without Lowdin, SVs diverge due to cond(S) ~ 10^4; without the Berry
+    phase, Wannier centers are wrong because the method cannot distinguish
+    atoms at different positions within the unit cell.
+
+    Formula (with Berry phase):
+        C_tilde(k) = S(k)^{1/2} C_sel(k)    (orthonormal columns)
+        phase_mu = exp(-i b_cart . tau_mu)
+        M_mn(k,b) = C_tilde^dag(k) . diag(phase) . C_tilde(k+b)
+
+    Formula (without Berry phase):
+        M_mn(k,b) = C_tilde^dag(k) . C_tilde(k+b)
+
+    where b_cart is the full Cartesian b-vector connecting k to k+b
+    (including any G_shift for BZ boundary wrapping). This unified
+    formula handles both interior (G=0) and boundary (G!=0) neighbors.
+
+    Parameters
+    ----------
+    k_idx : int
+        Index of the current k-point
+    next_k_idx : int
+        Index of the neighbor k-point
+    C_tilde_list : list of ndarray
+        Precomputed Lowdin-transformed eigenvectors, shape (N, N_w) each
+    b_cart : ndarray of shape (3,), optional
+        Cartesian b-vector from k to k+b. Required when berry_phase=True.
+    atom_positions : ndarray of shape (num_atoms, 3), optional
+        Atomic positions in Cartesian coordinates. Required when berry_phase=True.
+    basis_atom_map : ndarray of shape (num_orbitals,), optional
+        Maps each orbital to its atom index. Required when berry_phase=True.
+    berry_phase : bool, optional
+        If True (default), apply Berry phase exp(-i b_cart . tau_mu).
+        If False, compute plain inner product M = C_tilde^dag(k) . C_tilde(k+b).
+
+    Returns
+    -------
+    M_mn : ndarray
+        MMN overlap matrix, shape (num_bands, num_bands).
+        Singular values are bounded by [0, 1].
+    """
+    C_k = C_tilde_list[k_idx]
+    C_next = C_tilde_list[next_k_idx]
+
+    if berry_phase:
+        # Berry phase: exp(-i b_cart . tau_mu) per orbital
+        # This encodes the position operator e^{-ib.r} evaluated at each
+        # atomic center, carrying the intra-cell position information that
+        # Wannier90 needs for computing Wannier centers and spreads.
+        #
+        # The phase is applied to the RIGHT (neighbor) vector so that:
+        #   M_mn = sum_a C_tilde*_am(k) x exp(-i b.tau_a) x C_tilde_an(k+b)
+        #        = C_tilde^dag(k) . diag(exp(-i b.tau)) . C_tilde(k+b)
+        #
+        # This matches the midpoint method's sign convention (exp(-ib.tau))
+        # which gives correct Wannier centers via:
+        #   <r>_n = -(1/N_k) sum_{k,b} w_b b Im(ln M_nn)
+        taus = atom_positions[basis_atom_map]  # (num_orbitals, 3)
+        phase = np.exp(-1j * (taus @ b_cart))  # (num_orbitals,)
+
+        # M = C_tilde^dag(k) . diag(phase) . C_tilde(k+b)
+        M_mn = C_k.conj().T @ (phase[:, None] * C_next)
+    else:
+        # Plain inner product without Berry phase
+        M_mn = C_k.conj().T @ C_next
+
+    return M_mn
+
+
+def precompute_lowdin_eigenvectors(
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    band_indices: Optional[np.ndarray] = None,
+) -> List[np.ndarray]:
+    """
+    Precompute Löwdin-transformed eigenvectors C̃(k) = S(k)^{1/2} C(k).
+
+    The transformed vectors have orthonormal columns (C̃†C̃ = I),
+    enabling Mmn computation with bounded singular values.
+
+    Parameters
+    ----------
+    eigenvectors_list : list of ndarray
+        Full eigenvector matrices C(k), shape (N, N_all)
+    S_k_list : list of ndarray
+        Full overlap matrices S(k), shape (N, N)
+    band_indices : ndarray, optional
+        If given, select these bands from C(k) before transforming.
+
+    Returns
+    -------
+    C_tilde_list : list of ndarray
+        Löwdin-transformed eigenvectors, shape (N, num_bands) per k-point
+    """
+    C_tilde_list = []
+    for ik in range(len(eigenvectors_list)):
+        C_k = eigenvectors_list[ik]
+        S_k = S_k_list[ik]
+
+        # Select bands
+        if band_indices is not None:
+            C_sel = C_k[:, band_indices]
+        else:
+            C_sel = C_k
+
+        # Compute S^{1/2} via eigendecomposition
+        eigvals, eigvecs = np.linalg.eigh(S_k)
+        eigvals = np.maximum(eigvals, 1e-14)  # Clip for stability
+        S_half = eigvecs @ (np.sqrt(eigvals)[:, None] * eigvecs.conj().T)
+
+        # Löwdin-transformed eigenvectors
+        C_tilde = S_half @ C_sel
+        C_tilde_list.append(C_tilde)
+
+    return C_tilde_list
+
+
+def unitarize_mmn(M: np.ndarray) -> np.ndarray:
+    """
+    Force an overlap matrix to be unitary via polar decomposition.
+
+    Computes M_unitary = U @ V† where M = U @ Σ @ V† (SVD).
+    This is the closest unitary matrix to M in Frobenius norm.
+
+    Essential for LCAO methods with all-electron basis sets where the
+    midpoint approximation produces non-unitary overlap matrices due to
+    the large condition number of the overlap matrix S(k).
+
+    Parameters
+    ----------
+    M : ndarray of shape (N, N)
+        Input overlap matrix (possibly non-unitary)
+
+    Returns
+    -------
+    M_unitary : ndarray of shape (N, N)
+        Closest unitary matrix to M
+    """
+    U, _, Vh = np.linalg.svd(M)
+    return U @ Vh
+
+
+def soft_condition_mmn(M: np.ndarray, knee: float = 0.5) -> np.ndarray:
+    """
+    Soft-knee conditioning of an overlap matrix via SVD.
+
+    Smoothly pushes singular values toward 1 using a tanh function.
+    SVs near 1 are minimally perturbed; SVs far from 1 are pulled
+    toward 1 with a soft transition at the knee width.
+
+    The transformation is:
+        sigma_new = 1 + width * tanh((sigma - 1) / width)
+    where width = 1 - knee.
+
+    Parameters
+    ----------
+    M : ndarray of shape (N, N)
+        Input overlap matrix
+    knee : float
+        Controls the sharpness of the transition. SVs within
+        (1 - width) to (1 + width) are mostly preserved.
+        knee=0.5 gives width=0.5 (gentle); knee=0.99 gives
+        width=0.01 (aggressive, nearly hard unitarization).
+
+    Returns
+    -------
+    M_conditioned : ndarray of shape (N, N)
+        Conditioned matrix with SVs smoothly pushed toward 1
+    """
+    U, s, Vh = np.linalg.svd(M)
+    width = 1.0 - knee
+    if width < 1e-12:
+        # Degenerate case: knee=1.0 is equivalent to hard unitarization
+        return U @ Vh
+    s_new = 1.0 + width * np.tanh((s - 1.0) / width)
+    return U @ (s_new[:, np.newaxis] * Vh)
+
+
 def compute_mmn_direct(
     k_idx: int,
     next_k_idx: int,
@@ -101,11 +294,14 @@ def compute_mmn_direct(
     """
     Compute M_mn using the Symmetric Midpoint Approximation.
 
-    This implements the correct MMN matrix for LCAO methods using the
-    2π phase convention, which ensures proper BZ periodicity: S(k+G) = S(k).
+    This implements the MMN matrix for LCAO methods by evaluating the
+    overlap matrix S at the midpoint between k and k+b:
 
-    The method evaluates S at the physical midpoint between k and k+b:
-    M_mn = C_m^†(k) · S(k + b/2) · C_n(k+b)
+        M_mn(k,b) = C†_m(k) · S(k+b/2) · C_n(k+b)
+
+    The b-vector in fractional coordinates is computed directly from the
+    k-point indices and G_shift (from the .nnkp file), which is numerically
+    exact and avoids Cartesian-to-fractional conversion errors.
 
     Parameters
     ----------
@@ -154,18 +350,7 @@ def compute_mmn_direct(
     # k_mid is the actual location in reciprocal space where overlap occurs
     k_mid = k_curr + 0.5 * b_frac
 
-    # Debug for BZ boundary cases
-    debug_this = (k_idx == 0 and np.any(G_shift != 0))
-    if debug_this:
-        print(f"\n=== DEBUG MMN for k_idx=0, BZ boundary crossing ===")
-        print(f"  k_curr = {k_curr}")
-        print(f"  k_next = {k_next}")
-        print(f"  G_shift (from nnkp) = {G_shift}")
-        print(f"  b_frac = k_next + G_shift - k_curr = {b_frac}")
-        print(f"  k_mid = k_curr + 0.5*b_frac = {k_mid}")
-
     # Compute S at the midpoint
-    # With 2π convention, S(k_mid) = S(k_mid + G) for any G, so no correction needed
     if stacked is not None:
         _, S_mid = fourier_transform_vectorized(k_mid, stacked)
     else:
@@ -176,13 +361,6 @@ def compute_mmn_direct(
     C_next = eigenvectors[next_k_idx]
 
     M_mn = C_k.conj().T @ S_mid @ C_next
-
-    # Debug: print |det(M)| for boundary crossings
-    if debug_this:
-        det_M = np.linalg.det(M_mn)
-        print(f"  |det(M)| = {np.abs(det_M):.6f}")
-        U, s, Vh = np.linalg.svd(M_mn)
-        print(f"  Singular values: min={s.min():.4f}, max={s.max():.4f}")
 
     return M_mn
 
@@ -201,15 +379,14 @@ def compute_mmn_matrix(
     """
     Compute M_mn matrix using the Symmetric Midpoint Approximation.
 
-    DEPRECATED: Use compute_mmn_direct() instead, which uses the correct
-    real-space formula consistent with the π convention.
+    This uses the same formula as compute_mmn_direct() but converts b_frac
+    from the Cartesian b-vector rather than k-point indices. Prefer
+    compute_mmn_direct() when G_shift is available (e.g., from .nnkp file)
+    since it avoids the Cartesian-to-fractional conversion.
 
-    This implements the correct MMN matrix calculation for LCAO methods,
-    accounting for periodic boundary conditions via the physical b-vector.
+    Formula: M_mn(k,b) = C†_m(k) · [Phase ⊙ S(k+b/2)] · C_n(k+b)
 
-    The symmetric midpoint method evaluates the overlap matrix S at the
-    midpoint between k and k+b, then applies a symmetric Berry phase
-    correction based on the average atomic positions.
+    where Phase_μν = exp(-i b_cart · (τ_μ + τ_ν) / 2)
 
     Parameters
     ----------
@@ -220,13 +397,13 @@ def compute_mmn_matrix(
     kpoints : ndarray of shape (num_kpoints, 3)
         K-points in fractional coordinates
     b_vector_cart : ndarray of shape (3,)
-        Cartesian b-vector connecting k to k+b (in Angstrom)
+        Cartesian b-vector connecting k to k+b (in Angstrom^-1)
     real_space_matrices : dict
         Dict mapping (n1,n2,n3) -> {'H': H_matrix, 'S': S_matrix}
     lattice_vectors : ndarray of shape (3, 3)
         Real-space lattice vectors (rows are [a1, a2, a3])
     atom_positions : ndarray of shape (num_atoms, 3)
-        Atomic positions in Cartesian coordinates
+        Atomic positions in Cartesian coordinates (Angstrom)
     basis_atom_map : ndarray of shape (num_orbitals,)
         Maps each orbital to its atom index
     eigenvectors : list of ndarray
@@ -236,26 +413,14 @@ def compute_mmn_matrix(
     -------
     M_mn : ndarray
         MMN overlap matrix, shape (num_bands, num_bands)
-
-    Notes
-    -----
-    The symmetric midpoint method:
-    1. Computes k_mid = k + 0.5 * b_frac (using b-vector, not averaging k-points)
-    2. Evaluates S(k_mid) via Fourier transform
-    3. Applies symmetric Berry phase: exp[-i * b · (τ_i + τ_j) / 2]
-    4. Projects onto eigenvectors: M = C†(k) @ S_cross @ C(k+b)
-
-    This correctly handles periodic boundary crossings where k+b may wrap
-    around the Brillouin zone.
     """
     # 1. Get current k-point in fractional coordinates
     k_curr = kpoints[k_idx]
 
-    # 2. Midpoint Strategy (Corrected for PBC)
-    # Convert Cartesian b_vector to fractional coordinates
-    # lattice_vectors rows are [a1, a2, a3], need inverse of transpose
-    inv_lattice = np.linalg.inv(lattice_vectors.T)
-    b_frac = np.dot(inv_lattice, b_vector_cart)
+    # 2. Convert Cartesian b-vector to fractional coordinates
+    # Convention: k_cart = 2π * A^{-1} @ k_frac, so k_frac = (1/2π) * A @ k_cart
+    # where A = lattice_vectors has rows as real-space lattice vectors
+    b_frac = np.dot(lattice_vectors, b_vector_cart) / (2 * np.pi)
 
     # k_mid is exactly half a b-step away from k_curr
     k_mid = k_curr + 0.5 * b_frac
@@ -264,18 +429,10 @@ def compute_mmn_matrix(
     _, S_mid = fourier_transform_to_kspace(k_mid, real_space_matrices, lattice_vectors)
 
     # 4. Symmetric Berry Phase Correction
-    # Formula: exp[-i * b · (τ_i + τ_j) / 2]
-
-    # Get atom positions for each orbital (num_orbitals, 3)
-    taus = atom_positions[basis_atom_map]
-
-    # Calculate average position pairs: (τ_i + τ_j) / 2
-    # Broadcasting: (N, 1, 3) + (1, N, 3) -> (N, N, 3)
-    tau_mid = (taus[:, None, :] + taus[None, :, :]) / 2.0
-
-    # Calculate phase exponent: b_vec · tau_mid
-    # Sum over Cartesian components (axis 2)
-    phase_exponent = np.sum(tau_mid * b_vector_cart, axis=2)
+    # Formula: exp[-i * b_cart · (τ_μ + τ_ν) / 2]
+    taus = atom_positions[basis_atom_map]  # (num_orbitals, 3)
+    tau_mid = (taus[:, None, :] + taus[None, :, :]) / 2.0  # (N, N, 3)
+    phase_exponent = np.sum(tau_mid * b_vector_cart, axis=2)  # (N, N)
     phase_matrix = np.exp(-1j * phase_exponent)
 
     # 5. Apply phase correction element-wise to get cross-overlap
@@ -328,6 +485,79 @@ def write_eig_file(
                     f"{band_idx + 1:5d} {k_idx + 1:5d} "
                     f"{eigenvalues[band_idx].real:18.12f}\n"
                 )
+
+
+def write_amn_file_pdwf(
+    filename: str,
+    eigenvectors_list: List[np.ndarray],
+    S_k_list: List[np.ndarray],
+    target_mask: np.ndarray,
+    band_indices: np.ndarray,
+    num_kpoints: int,
+    num_wann: int,
+) -> None:
+    """
+    Write the .amn file using PDWF target subspace projection via SVD.
+
+    Projects each Bloch eigenstate onto the FULL target orbital subspace
+    (all multi-zeta AOs), then uses SVD to find the optimal num_wann-dimensional
+    trial functions. This avoids the bias of selecting specific AO indices.
+
+    The projection is:
+        A_full(k) = [S(k) C(k)]_{target, bands}^T  (num_bands × num_target)
+        U, Σ, V† = SVD(A_full)
+        A_optimal(k) = U[:, :num_wann] @ diag(Σ[:num_wann])  (num_bands × num_wann)
+
+    Parameters
+    ----------
+    filename : str
+        Output .amn filename
+    eigenvectors_list : list of ndarray
+        Full eigenvector matrices C(k), shape (num_orbitals, num_bands_all)
+    S_k_list : list of ndarray
+        Full overlap matrices S(k), shape (num_orbitals, num_orbitals)
+    target_mask : ndarray of bool
+        Boolean mask identifying ALL target orbitals (including multi-zeta)
+    band_indices : ndarray
+        Indices of selected bands
+    num_kpoints : int
+        Number of k-points
+    num_wann : int
+        Number of Wannier functions (must be <= num_target)
+    """
+    target_indices = np.where(target_mask)[0]
+    num_target = len(target_indices)
+    num_bands = len(band_indices)
+
+    if num_wann > num_target:
+        raise ValueError(f"num_wann ({num_wann}) > num_target ({num_target})")
+
+    with open(filename, 'w') as f:
+        f.write("Created by LCAO-to-Wannier90 (PDWF target subspace SVD)\n")
+        f.write(f"{num_bands:5d} {num_kpoints:5d} {num_wann:5d}\n")
+
+        for k_idx in range(num_kpoints):
+            C_k = eigenvectors_list[k_idx]
+            S_k = S_k_list[k_idx]
+
+            # Full projection onto ALL target orbitals
+            # P_k = S(k) @ C(k), then select target rows and band columns
+            P_k = S_k @ C_k  # (num_orbitals, num_bands_all)
+            A_full = P_k[np.ix_(target_indices, band_indices)].T  # (num_bands, num_target)
+
+            # SVD to find optimal num_wann-dimensional projection
+            U, sigma, Vh = np.linalg.svd(A_full, full_matrices=False)
+            # A_optimal = U[:, :num_wann] @ diag(sigma[:num_wann])
+            # This preserves the magnitude structure from the SVD
+            A_opt = U[:, :num_wann] * sigma[:num_wann]  # (num_bands, num_wann)
+
+            # Write: band_idx  wannier_idx  kpoint_idx  Re(A)  Im(A)
+            for m in range(num_bands):
+                for n in range(num_wann):
+                    f.write(
+                        f"{m + 1:5d} {n + 1:5d} {k_idx + 1:5d} "
+                        f"{A_opt[m, n].real:18.12f} {A_opt[m, n].imag:18.12f}\n"
+                    )
 
 
 def write_amn_file_lcao(
@@ -486,21 +716,32 @@ def write_mmn_file_lcao(
     convention: str = 'pi',
     use_direct_method: bool = True,
     verbose: bool = False,
-    stacked: 'StackedMatrices' = None
+    stacked: 'StackedMatrices' = None,
+    unitarize: bool = False,
+    method: str = 'lowdin',
+    S_k_list: Optional[List[np.ndarray]] = None,
+    band_indices: Optional[np.ndarray] = None,
+    recip_lattice: Optional[np.ndarray] = None,
+    conditioning: Optional[str] = None,
+    conditioning_knee: float = 0.5,
 ) -> None:
     """
     Write the .mmn file for LCAO methods.
 
-    This implements the MMN matrix calculation for LCAO methods with two
+    This implements the MMN matrix calculation for LCAO methods with three
     available algorithms:
 
-    1. Direct method (use_direct_method=True, default):
-       Uses direct real-space summation with explicit phase factors.
-       Formula: M_mn = Σ_R exp(i*π*b·R) * exp(-i*b·(τ_j-τ_i)) * C†(k) S(R) C(k+b)
+    1. Löwdin method (method='lowdin', default, RECOMMENDED):
+       Transforms eigenvectors to Löwdin-orthogonalized basis where S=I,
+       then computes M as inner products. SVs bounded by [0,1].
+       Formula: M = [S^{1/2}(k)C(k)]† · D_G · [S^{1/2}(k+b)C(k+b)]
 
-    2. Symmetric midpoint method (use_direct_method=False):
-       Evaluates S at midpoint k + 0.5*b with Berry phase correction.
-       Formula: M = C†(k) @ S(k_mid) @ phase_matrix @ C(k+b)
+    2. Direct midpoint method (method='midpoint', use_direct_method=True):
+       Uses symmetric midpoint approximation with Berry phase correction.
+       Formula: M = C†(k) · [Phase ⊙ S(k+b/2)] · C(k+b)
+
+    3. Symmetric midpoint method (method='midpoint', use_direct_method=False):
+       Same formula via Cartesian b-vector conversion.
 
     Parameters
     ----------
@@ -518,7 +759,7 @@ def write_mmn_file_lcao(
         Maps k_idx -> list of neighbor dicts with keys:
             'id': neighbor k-point index
             'G_shift': integer lattice vector (n1, n2, n3)
-            'b_vec_cart': Cartesian b-vector in Angstrom
+            'b_vec_cart': Cartesian b-vector (used by midpoint method only)
     atom_positions : ndarray
         Atomic positions in Cartesian coordinates, shape (num_atoms, 3)
     basis_atom_map : ndarray
@@ -529,14 +770,61 @@ def write_mmn_file_lcao(
         Number of Wannier functions (selected bands)
     convention : str, optional
         'pi' for π convention (Crystal23), '2pi' for 2π convention
-        Default is 'pi'
     use_direct_method : bool, optional
-        If True, use the direct real-space method (default).
-        If False, use the symmetric midpoint method.
+        If True, use the direct method for midpoint approach (default).
     verbose : bool, optional
         If True, print diagnostic information (default: False)
+    unitarize : bool, optional
+        If True, force each M matrix to be unitary via SVD polar
+        decomposition. Default: False.
+    method : str, optional
+        'lowdin' (default): Lowdin orthogonalization method with Berry phase.
+            Requires S_k_list parameter.
+        'lowdin_no_berry': Lowdin method WITHOUT Berry phase (for comparison).
+            Requires S_k_list parameter. Produces plain inner products.
+        'midpoint': Symmetric midpoint approximation with Berry phase.
+    S_k_list : list of ndarray, optional
+        Full overlap matrices S(k) for each k-point (required for Lowdin).
+    band_indices : ndarray, optional
+        Band indices for Lowdin method (if eigenvectors_list contains
+        full eigenvectors rather than band-selected ones).
+    recip_lattice : ndarray, optional
+        Reciprocal lattice vectors (rows), shape (3, 3).
+        Required for Lowdin with Berry phase.
+    conditioning : str or None, optional
+        Post-processing of M matrices. Overrides `unitarize` if set.
+        None: use `unitarize` parameter for backward compatibility.
+        'none': no conditioning.
+        'svd': SVD polar decomposition (hard unitarization, M = U V†).
+        'soft': soft-knee conditioning via tanh (smooth push toward 1).
+    conditioning_knee : float, optional
+        Knee parameter for soft conditioning (default: 0.5).
+        Controls sharpness: 0.5 = gentle, 0.99 = aggressive.
     """
-    method_name = "Direct Real-Space" if use_direct_method else "Symmetric Midpoint"
+    # Resolve conditioning mode
+    if conditioning is not None:
+        do_svd = (conditioning == 'svd')
+        do_soft = (conditioning == 'soft')
+    else:
+        do_svd = unitarize
+        do_soft = False
+
+    use_lowdin = (method in ('lowdin', 'lowdin_no_berry') and S_k_list is not None)
+    use_berry_phase = (method == 'lowdin')  # no berry for 'lowdin_no_berry'
+
+    if use_lowdin:
+        method_name = "Lowdin" + ("" if use_berry_phase else " (no Berry phase)")
+        # Precompute Lowdin-transformed eigenvectors
+        if verbose:
+            print(f"  Precomputing Lowdin-transformed eigenvectors...")
+        C_tilde_list = precompute_lowdin_eigenvectors(
+            eigenvectors_list, S_k_list, band_indices
+        )
+    else:
+        if method == 'lowdin' and S_k_list is None:
+            if verbose:
+                print(f"  WARNING: S_k_list not provided, falling back to midpoint method")
+        method_name = "Direct Real-Space" if use_direct_method else "Symmetric Midpoint"
 
     with open(filename, 'w') as f:
         # Write header
@@ -546,54 +834,92 @@ def write_mmn_file_lcao(
 
         # Diagnostic tracking
         if verbose:
-            diag_traces = []  # Track trace of M matrices (should be close to num_wann for identity)
+            diag_traces = []
+            unitarity_errors = []
 
         # Process each k-point
         for k_idx in range(num_kpoints):
-            # Process each neighbor
             for neighbor in neighbor_list[k_idx]:
                 k_next_idx = neighbor['id']
                 G_shift = neighbor['G_shift']
-                b_vec_cart = neighbor['b_vec_cart']  # Cartesian b-vector
 
-                # Compute MMN matrix using selected method
-                if use_direct_method:
-                    M_kb = compute_mmn_direct(
-                        k_idx, k_next_idx, kpoints, b_vec_cart,
-                        real_space_matrices, lattice_vectors,
-                        atom_positions, basis_atom_map, eigenvectors_list,
-                        symmetrize=True,
-                        G_shift=G_shift,
-                        stacked=stacked
-                    )
+                if use_lowdin:
+                    # Lowdin method:
+                    # With Berry: M = C_tilde^dag(k) . diag(exp(-i b.tau)) . C_tilde(k+b)
+                    # Without:    M = C_tilde^dag(k) . C_tilde(k+b)
+                    if use_berry_phase:
+                        G_shift_float = np.asarray(G_shift, dtype=float)
+                        b_frac = kpoints[k_next_idx] + G_shift_float - kpoints[k_idx]
+                        b_cart = recip_lattice.T @ b_frac
+                        M_kb = compute_mmn_lowdin(
+                            k_idx, k_next_idx, C_tilde_list,
+                            b_cart=b_cart,
+                            atom_positions=atom_positions,
+                            basis_atom_map=basis_atom_map,
+                            berry_phase=True,
+                        )
+                    else:
+                        M_kb = compute_mmn_lowdin(
+                            k_idx, k_next_idx, C_tilde_list,
+                            berry_phase=False,
+                        )
                 else:
-                    M_kb = compute_mmn_matrix(
-                        k_idx, k_next_idx, kpoints, b_vec_cart,
-                        real_space_matrices, lattice_vectors,
-                        atom_positions, basis_atom_map, eigenvectors_list
-                    )
+                    # Midpoint method
+                    b_vec_cart = neighbor.get('b_vec_cart', np.zeros(3))
 
-                # Diagnostic: check if this is a self-overlap (k_idx == k_next_idx with G=0)
-                if verbose and k_idx == k_next_idx and tuple(G_shift) == (0, 0, 0):
+                    if use_direct_method:
+                        M_kb = compute_mmn_direct(
+                            k_idx, k_next_idx, kpoints, b_vec_cart,
+                            real_space_matrices, lattice_vectors,
+                            atom_positions, basis_atom_map, eigenvectors_list,
+                            symmetrize=True,
+                            G_shift=G_shift,
+                            stacked=stacked
+                        )
+                    else:
+                        M_kb = compute_mmn_matrix(
+                            k_idx, k_next_idx, kpoints, b_vec_cart,
+                            real_space_matrices, lattice_vectors,
+                            atom_positions, basis_atom_map, eigenvectors_list
+                        )
+
+                # Apply conditioning if requested
+                if do_svd or do_soft:
+                    if verbose:
+                        MhM = M_kb.conj().T @ M_kb
+                        unitarity_errors.append(
+                            np.linalg.norm(MhM - np.eye(M_kb.shape[0])) / M_kb.shape[0]
+                        )
+                    if do_svd:
+                        M_kb = unitarize_mmn(M_kb)
+                    elif do_soft:
+                        M_kb = soft_condition_mmn(M_kb, knee=conditioning_knee)
+
+                # Diagnostic: check self-overlap
+                if verbose and k_idx == k_next_idx and np.all(np.asarray(G_shift) == 0):
                     trace = np.trace(M_kb)
                     diag_traces.append((k_idx, trace))
 
                 # --- WRITE TO FILE ---
-                # Write neighbor identification line
                 f.write(f"{k_idx+1:5d} {k_next_idx+1:5d} "
                        f"{G_shift[0]:5d} {G_shift[1]:5d} {G_shift[2]:5d}\n")
 
-                # Write matrix elements (column-major order for Fortran compatibility)
                 for n in range(num_wann):
                     for m in range(num_wann):
                         val = M_kb[m, n]
                         f.write(f"{val.real:18.12f} {val.imag:18.12f}\n")
 
-        if verbose and diag_traces:
+        if verbose:
             print(f"\n  MMN Diagnostics ({method_name} method):")
-            print(f"  Self-overlap traces (should be ≈ {num_wann}):")
-            for k_idx, trace in diag_traces:
-                print(f"    k={k_idx}: Tr(M) = {trace.real:.6f} + {trace.imag:.6f}i")
+            if unitarity_errors:
+                mean_err = np.mean(unitarity_errors)
+                max_err = np.max(unitarity_errors)
+                cond_label = "svd" if do_svd else "soft"
+                print(f"  Pre-conditioning ({cond_label}): ||M†M-I||/N mean={mean_err:.6f}, max={max_err:.6f}")
+            if diag_traces:
+                print(f"  Self-overlap traces (should be ≈ {num_wann}):")
+                for k_idx_d, trace in diag_traces[:5]:
+                    print(f"    k={k_idx_d}: Tr(M) = {trace.real:.6f} + {trace.imag:.6f}i")
 
 
 def write_mmn_file(
