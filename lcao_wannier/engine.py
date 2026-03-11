@@ -217,6 +217,7 @@ class Wannier90Engine:
 
         # Override for num_iter (used by direct method to skip minimization)
         self._override_num_iter = None
+        self._override_dis_num_iter = None
 
         # Disentanglement parameters (set by smart band selector)
         self._num_bands_for_win = None   # num_bands for .win (may differ from num_wann)
@@ -225,6 +226,9 @@ class Wannier90Engine:
 
         # Pre-stack R-space matrices for vectorized Fourier assembly
         self._stacked = stack_real_space_matrices(real_space_matrices)
+
+        # PDWF target mask (set by _apply_method_pdwf for SVD-based Amn)
+        self.pdwf_target_mask = None
 
         # Conditioning validation result (set by solve_all_kpoints)
         self._conditioning_result = None
@@ -815,13 +819,27 @@ class Wannier90Engine:
 
         # Write .amn file (uses overlap-corrected LCAO projections)
         amn_file = f"{self.seedname}.amn"
-        # For LCAO methods, use A = S(k) @ C(k) formula
-        if self.selected_orbital_indices is not None:
+        if self.pdwf_target_mask is not None:
+            # PDWF method: SVD-based projection onto full target subspace
+            from .wannier90 import write_amn_file_pdwf
+            write_amn_file_pdwf(
+                amn_file,
+                self.eigenvectors_list,
+                self.S_k_list,
+                self.pdwf_target_mask,
+                band_indices,
+                self.num_kpoints,
+                self.num_wann,
+            )
+            if verbose:
+                n_target = int(np.sum(self.pdwf_target_mask))
+                print(f"  ℹ PDWF Amn: SVD projection onto {n_target} target AOs → {self.num_wann} WFs")
+        elif self.selected_orbital_indices is not None:
             from .wannier90 import write_amn_file_lcao
             write_amn_file_lcao(
                 amn_file,
-                self.eigenvectors_list,  # Full eigenvectors
-                self.S_k_list,  # Full overlap matrices
+                self.eigenvectors_list,
+                self.S_k_list,
                 self.selected_orbital_indices,
                 band_indices,
                 self.num_kpoints,
@@ -833,32 +851,28 @@ class Wannier90Engine:
             num_entries = self.num_kpoints * len(band_indices) * len(band_indices)
             print(f"  ✓ {amn_file}: {num_entries} matrix elements")
 
-        # Write .mmn file (with atomic center phase correction if available)
+        # Write .mmn file using Löwdin orthogonalization method
         mmn_file = f"{self.seedname}.mmn"
         if self.atom_positions is not None and self.basis_atom_map is not None:
-            # Use phase-corrected LCAO MMN writer
             from .wannier90 import write_mmn_file_lcao
 
             # Convert neighbor list to dict format if needed
             # Old format: List[Tuple[int, np.ndarray]] per k-point
             # New format: List[Dict[str, Any]] per k-point with 'id', 'G_shift', 'b_vec_cart'
             if neighbor_list_to_use and isinstance(neighbor_list_to_use[0][0], tuple):
-                # Old format - convert to new
-                print("  ℹ Converting internally generated neighbors to dict format...")
+                # Old format - convert to new (pass kpoints for correct b_vec_cart)
+                if verbose:
+                    print("  ℹ Converting internally generated neighbors to dict format...")
                 from .kpoints import convert_neighbor_list_to_dict_format
                 neighbor_list_to_use = convert_neighbor_list_to_dict_format(
                     neighbor_list_to_use,
-                    self.recip_lattice
+                    self.recip_lattice,
+                    kpoints=self.kpoints,
                 )
-            
-            if verbose:
-                print(f"  DEBUG: eigenvectors_selected[0].shape = {eigenvectors_selected[0].shape}")
-                print(f"  DEBUG: len(band_indices) = {len(band_indices)}")
-                print(f"  DEBUG: band_indices = {band_indices}")
 
             write_mmn_file_lcao(
                 mmn_file,
-                eigenvectors_selected,
+                self.eigenvectors_list,  # Pass FULL eigenvectors (Löwdin selects bands)
                 self.kpoints,
                 self.real_space_matrices,
                 self.lattice_vectors,
@@ -868,9 +882,14 @@ class Wannier90Engine:
                 self.num_kpoints,
                 len(band_indices),
                 convention='pi',
-                use_direct_method=True,  # Use new direct real-space method
+                use_direct_method=True,
                 verbose=verbose,
-                stacked=self._stacked
+                stacked=self._stacked,
+                unitarize=False,  # Löwdin SVs bounded by [0,1], no unitarization needed
+                method='lowdin',
+                S_k_list=self.S_k_list,
+                band_indices=band_indices,
+                recip_lattice=self.recip_lattice,
             )
         else:
             # Fallback to standard MMN writer (no phase correction)
@@ -885,6 +904,10 @@ class Wannier90Engine:
 
         # Write parameter file (.win)
         if write_win:
+            extra_kwargs = {}
+            if self._override_dis_num_iter is not None:
+                extra_kwargs['dis_num_iter'] = self._override_dis_num_iter
+            extra_kwargs.update(getattr(self, '_additional_keywords', {}))
             win_config = create_win_config_from_engine(
                 self,
                 atoms=atoms,
@@ -896,7 +919,7 @@ class Wannier90Engine:
                 use_bloch_phases=False,
                 num_iter=self._override_num_iter,
                 guiding_centres=getattr(self, '_guiding_centres', False),
-                additional_keywords=getattr(self, '_additional_keywords', {}),
+                **extra_kwargs,
             )
             write_win_file(self.seedname, win_config, verbose=verbose)
 

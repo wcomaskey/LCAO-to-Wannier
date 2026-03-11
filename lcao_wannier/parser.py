@@ -328,12 +328,47 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
     # Check which atoms have explicit basis function listings
     atoms_with_basis = set(atom_idx for atom_idx, _, _ in basis_ranges)
     max_basis_index = max(end for _, _, end in basis_ranges)
+    num_atoms = len(atom_symbols)
 
-    if len(atoms_with_basis) == 1 and len(atom_symbols) > 1:
+    # Identify atoms WITHOUT explicit basis function listings
+    # Crystal23 omits symmetry-equivalent atoms from the basis section
+    atoms_without_basis = [i for i in range(num_atoms) if i not in atoms_with_basis]
+
+    if len(atoms_with_basis) == 1 and num_atoms > 1:
         # Only one atom has explicit orbitals (homoatomic, e.g. Bi2)
         # Assume symmetric: replicate for all atoms
         num_basis_per_atom = max_basis_index + 1
-        num_basis = num_basis_per_atom * len(atom_symbols)
+        num_basis = num_basis_per_atom * num_atoms
+    elif atoms_without_basis:
+        # Some atoms lack explicit basis listings (e.g., MgB2 where B2
+        # is a symmetry copy of B1). Replicate basis from same-element atom.
+        # First, compute per-atom basis counts from explicitly listed atoms
+        atom_basis_counts = {}
+        for atom_idx in atoms_with_basis:
+            atom_ranges = [(f, l) for a, f, l in basis_ranges if a == atom_idx]
+            if atom_ranges:
+                first = min(f for f, _ in atom_ranges)
+                last = max(l for _, l in atom_ranges)
+                atom_basis_counts[atom_idx] = last - first + 1
+
+        # For each missing atom, find a same-element atom with explicit basis
+        extra_basis = 0
+        missing_atom_basis_count = {}
+        for missing_idx in atoms_without_basis:
+            missing_sym = atom_symbols[missing_idx]
+            # Find a reference atom of the same element
+            ref_count = None
+            for ref_idx in atoms_with_basis:
+                if atom_symbols[ref_idx] == missing_sym and ref_idx in atom_basis_counts:
+                    ref_count = atom_basis_counts[ref_idx]
+                    break
+            if ref_count is None:
+                # No same-element reference found; use average
+                ref_count = (max_basis_index + 1) // max(len(atoms_with_basis), 1)
+            missing_atom_basis_count[missing_idx] = ref_count
+            extra_basis += ref_count
+
+        num_basis = max_basis_index + 1 + extra_basis
     else:
         # All atoms have explicit orbitals with global indexing (heteroatomic, e.g. SnTe)
         num_basis = max_basis_index + 1
@@ -341,13 +376,23 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
     # Create basis-to-atom mapping
     basis_atom_map = np.zeros(num_basis, dtype=int)
 
-    if len(atoms_with_basis) == 1 and len(atom_symbols) > 1:
+    if len(atoms_with_basis) == 1 and num_atoms > 1:
         # Fill in symmetrically for all atoms
         num_basis_per_atom = max_basis_index + 1
-        for atom_idx in range(len(atom_symbols)):
+        for atom_idx in range(num_atoms):
             start_basis = atom_idx * num_basis_per_atom
             end_basis = (atom_idx + 1) * num_basis_per_atom
             basis_atom_map[start_basis:end_basis] = atom_idx
+    elif atoms_without_basis:
+        # Fill explicit atoms first
+        for atom_idx, first, last in basis_ranges:
+            basis_atom_map[first:last+1] = atom_idx
+        # Append replicated basis for missing atoms
+        offset = max_basis_index + 1
+        for missing_idx in atoms_without_basis:
+            count = missing_atom_basis_count[missing_idx]
+            basis_atom_map[offset:offset+count] = missing_idx
+            offset += count
     else:
         # Use explicit ranges
         for atom_idx, first, last in basis_ranges:
@@ -357,7 +402,7 @@ def parse_atomic_basis_info(lines: List[str]) -> AtomicBasisInfo:
         atom_positions=atom_positions,
         atom_symbols=atom_symbols,
         basis_atom_map=basis_atom_map,
-        num_atoms=len(atom_symbols),
+        num_atoms=num_atoms,
         num_basis=num_basis
     )
 
@@ -841,5 +886,142 @@ def create_spin_block_matrices(
                 # Enforce exact symmetry: S(-R) = S(R)^T
                 S_minus_R_full = S_R_full.T
                 S_full_list.append((minus_R_cart, S_minus_R_full))
+
+    return H_full_list, S_full_list
+
+
+def create_nonsoc_full_matrices(
+    H_R_dict: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    S_R_dict: Dict[Tuple[int, int, int], np.ndarray],
+    direct_lattice_vectors: List[List[float]],
+    PRINTOUT: bool = False
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[Tuple[np.ndarray, np.ndarray]]]:
+    """
+    Construct full N x N Hamiltonian and overlap matrices for non-SOC systems.
+
+    Crystal23 prints matrices in lower-triangular format. This function
+    reconstructs the full symmetric matrices using the (R, -R) pair relationship:
+        H(R) = Lower(R) + StrictLower(-R)^T
+        H(-R) = H(R)^T   (real symmetric for non-SOC)
+        S(R) = Lower(R) + StrictLower(-R)^T
+        S(-R) = S(R)^T
+
+    For the origin R=(0,0,0), the matrix is self-symmetric:
+        S(0) = Lower(S_raw) + StrictLower(S_raw)^T
+
+    This is the non-SOC equivalent of create_spin_block_matrices.
+
+    Parameters
+    ----------
+    H_R_dict : dict
+        Maps R-vector tuple -> {spin_channel: matrix}
+    S_R_dict : dict
+        Maps R-vector tuple -> matrix
+    direct_lattice_vectors : list of list of float
+        3x3 lattice vectors
+    PRINTOUT : bool
+        Whether to print diagnostic information
+
+    Returns
+    -------
+    H_full_list : list of tuples (R_cartesian, H_matrix)
+    S_full_list : list of tuples (R_cartesian, S_matrix)
+    """
+    H_full_list = []
+    S_full_list = []
+    direct_lattice_vectors = np.array(direct_lattice_vectors)
+
+    all_R_vectors = set(H_R_dict.keys()) | set(S_R_dict.keys())
+
+    # Identify valid (R, -R) pairs
+    processed_R = set()
+    valid_pairs = []
+
+    sorted_R = sorted(list(all_R_vectors))
+
+    for R in sorted_R:
+        if R in processed_R:
+            continue
+
+        minus_R = tuple(-x for x in R)
+
+        if R == (0, 0, 0):
+            valid_pairs.append((R, R))
+            processed_R.add(R)
+        elif minus_R in all_R_vectors:
+            valid_pairs.append((R, minus_R))
+            processed_R.add(R)
+            processed_R.add(minus_R)
+        else:
+            if PRINTOUT:
+                print(f"Warning: Vector {R} exists but {minus_R} is missing. Excluding.")
+
+    for R, minus_R in valid_pairs:
+        is_origin = (R == minus_R)
+
+        # Calculate Cartesian vectors
+        R_cart = np.dot(np.array(R), direct_lattice_vectors)
+        minus_R_cart = np.dot(np.array(minus_R), direct_lattice_vectors)
+
+        # ============================================================
+        # 1. HAMILTONIAN CONSTRUCTION
+        # ============================================================
+        if R in H_R_dict:
+            # Get the raw lower-triangular Fock matrix for R
+            H_mats_R = H_R_dict[R]
+            H_raw_R = list(H_mats_R.values())[0] if isinstance(H_mats_R, dict) else H_mats_R
+            H_raw_R = np.tril(H_raw_R)  # Enforce lower triangle
+
+            if is_origin:
+                # Origin: H(0) = Lower + StrictLower^T (symmetric)
+                H_R_full = H_raw_R + np.tril(H_raw_R, -1).T
+                H_full_list.append((R_cart, H_R_full))
+            else:
+                if minus_R in H_R_dict:
+                    H_mats_mR = H_R_dict[minus_R]
+                    H_raw_mR = list(H_mats_mR.values())[0] if isinstance(H_mats_mR, dict) else H_mats_mR
+                    H_raw_mR = np.tril(H_raw_mR)
+
+                    # H(R) = Lower(R) + StrictLower(-R)^T
+                    H_mR_nodiag = H_raw_mR.copy()
+                    np.fill_diagonal(H_mR_nodiag, 0)
+                    H_R_full = H_raw_R + H_mR_nodiag.T
+
+                    H_full_list.append((R_cart, H_R_full))
+
+                    # H(-R) = H(R)^T (real symmetric for non-SOC)
+                    H_minus_R_full = H_R_full.T
+                    H_full_list.append((minus_R_cart, H_minus_R_full))
+                else:
+                    if PRINTOUT:
+                        print(f"Warning: H at {minus_R} missing for pair with {R}")
+
+        # ============================================================
+        # 2. OVERLAP CONSTRUCTION
+        # ============================================================
+        if R in S_R_dict:
+            S_raw_R = np.tril(S_R_dict[R])  # Enforce lower triangle
+
+            if is_origin:
+                # Origin: S(0) = Lower + StrictLower^T (symmetric)
+                S_R_full = S_raw_R + np.tril(S_raw_R, -1).T
+                S_full_list.append((R_cart, S_R_full))
+            else:
+                if minus_R in S_R_dict:
+                    S_raw_mR = np.tril(S_R_dict[minus_R])
+
+                    # S(R) = Lower(R) + StrictLower(-R)^T
+                    S_mR_nodiag = S_raw_mR.copy()
+                    np.fill_diagonal(S_mR_nodiag, 0)
+                    S_R_full = S_raw_R + S_mR_nodiag.T
+
+                    S_full_list.append((R_cart, S_R_full))
+
+                    # S(-R) = S(R)^T (real symmetric for non-SOC)
+                    S_minus_R_full = S_R_full.T
+                    S_full_list.append((minus_R_cart, S_minus_R_full))
+                else:
+                    if PRINTOUT:
+                        print(f"Warning: S at {minus_R} missing for pair with {R}")
 
     return H_full_list, S_full_list

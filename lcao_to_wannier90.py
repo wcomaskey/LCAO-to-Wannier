@@ -7,6 +7,7 @@ This script implements the Wannier90 workflow with three stages:
 Stage 1: Generate .win file from CRYSTAL/LCAO output
 Stage 2: Generate .eig, .amn, .mmn files using .nnkp neighbor information
 Stage 3: Symmetrize wannier90_hr.dat using crystal symmetry (Reynolds operator)
+Stage 4: Plot LCAO band structure with PDWF projectability coloring
 
 Usage:
     # Stage 1: Create .win file
@@ -21,6 +22,9 @@ Usage:
 
     # Stage 3: Symmetrize the tight-binding Hamiltonian
     python lcao_to_wannier90.py --stage 3 --input material.out --seedname material
+
+    # Stage 4: Plot band structure with projectability
+    python lcao_to_wannier90.py --stage 4 --input material.out --seedname material
 
 For help:
     python lcao_to_wannier90.py --help
@@ -37,6 +41,7 @@ from lcao_wannier import (
     parse_calculation_parameters,
     parse_atomic_basis_info,
     create_spin_block_matrices,
+    create_nonsoc_full_matrices,
     prepare_real_space_matrices,
     Wannier90Engine,
     suggest_optimal_window,
@@ -46,6 +51,15 @@ from lcao_wannier import (
 )
 from lcao_wannier.projectability import select_bands_by_projectability, smart_select_bands
 from lcao_wannier.parser import parse_orbital_types
+from lcao_wannier.basis_parser import parse_basis_shells, get_atom_list
+from lcao_wannier.valence_config import (
+    build_target_mask, compute_num_wann, summarize_config,
+)
+from lcao_wannier.lcao_pdwf import (
+    compute_lowdin_projectability, classify_bands, determine_windows,
+    check_frozen_interlopers, check_band_count, print_pdwf_summary,
+    ClassificationParams,
+)
 
 # Threshold above which --method direct warns the user
 LARGE_BASIS_THRESHOLD = 200
@@ -168,6 +182,203 @@ def _apply_method_projectability(engine, args, has_soc=False):
     print(f"\nSelecting projection orbitals (method={proj_method})...")
     print("-" * 80)
     engine.select_projections(verbose=True, method=proj_method)
+
+
+def _apply_method_pdwf(engine, args, has_soc, lines):
+    """Apply LCAO-PDWF method: chemistry-grounded projectability band selection."""
+    print("\nLCAO-PDWF band selection...")
+    print("-" * 80)
+
+    extended = getattr(args, 'extended', False)
+    include_tm_p = getattr(args, 'include_tm_p', False)
+    p_high = getattr(args, 'pdwf_p_high', 0.90)
+    p_low = getattr(args, 'pdwf_p_low', 0.10)
+
+    # Phase 1: Parse basis shells
+    print("  Phase 1: Parsing basis set shells...")
+    try:
+        from lcao_wannier.parser import parse_calculation_parameters
+        params_calc = parse_calculation_parameters(lines)
+        num_atoms_hint = params_calc.num_atoms
+    except Exception:
+        num_atoms_hint = None
+
+    shells, num_ao_spatial = parse_basis_shells(lines, num_atoms=num_atoms_hint)
+    atoms = get_atom_list(shells)
+    print(f"    Found {len(shells)} shells, {num_ao_spatial} spatial AOs")
+    print(f"    Atoms: {atoms}")
+
+    # Phase 2: Build target mask
+    print("  Phase 2: Building target orbital mask...")
+    target_mask = build_target_mask(
+        shells, extended=extended, include_tm_p=include_tm_p,
+        has_soc=has_soc, verbose=True,
+    )
+    num_wann = compute_num_wann(
+        atoms, extended=extended, include_tm_p=include_tm_p,
+        has_soc=has_soc,
+    )
+    print(f"\n    Target AOs: {int(np.sum(target_mask))} / {len(target_mask)}")
+    print(f"    num_wann: {num_wann}")
+    print(summarize_config(atoms, extended=extended,
+                           include_tm_p=include_tm_p, has_soc=has_soc))
+
+    # Phase 3: Compute Lowdin projectability
+    print("\n  Phase 3: Computing Lowdin projectability...")
+    eigenvalues = np.array(engine.eigenvalues_list)
+    proj = compute_lowdin_projectability(
+        engine.eigenvectors_list, engine.S_k_list, target_mask,
+    )
+    print(f"    Projectability range: [{np.min(proj):.4f}, {np.max(proj):.4f}]")
+
+    # Phase 4: Classify bands
+    print("\n  Phase 4: Classifying bands...")
+    e_fermi = engine.e_fermi if engine.e_fermi is not None else 0.0
+    classification = classify_bands(
+        proj, eigenvalues, num_wann,
+        ClassificationParams(p_high=p_high, p_low=p_low, e_fermi=e_fermi),
+    )
+
+    # Phase 5: Determine windows
+    print("\n  Phase 5: Determining disentanglement windows...")
+    windows = determine_windows(classification, eigenvalues, e_fermi)
+
+    # Validate
+    all_warnings = []
+    if windows.dis_froz_min is not None:
+        all_warnings += check_frozen_interlopers(
+            eigenvalues, classification.frozen_indices,
+            classification.excluded_indices,
+            windows.dis_froz_min, windows.dis_froz_max,
+        )
+    if windows.dis_win_min is not None:
+        all_warnings += check_band_count(
+            eigenvalues, windows.dis_win_min, windows.dis_win_max, num_wann,
+        )
+
+    # Print summary
+    print_pdwf_summary(classification, windows, eigenvalues,
+                       e_fermi, all_warnings)
+
+    # Handle poor projectability gap gracefully
+    if classification.gap_quality < 2.0:
+        print(f"\n  WARNING: Poor projectability gap (quality = "
+              f"{classification.gap_quality:.2f}).")
+        if len(classification.frozen_indices) == 0:
+            # No frozen bands found — use energy-range-based freezing.
+            # Freeze all bands with reasonable projectability below E_F + margin
+            froz_margin_above = 3.0  # eV above E_F
+            print(f"  No frozen bands from projectability. Using energy-range "
+                  f"freezing up to E_F + {froz_margin_above:.1f} eV.")
+            # Promote bands with avg_p >= p_low that are mostly below threshold
+            avg_e = classification.band_energies
+            avg_p = classification.avg_projectability
+            for b in range(len(avg_p)):
+                if (avg_p[b] >= p_low and
+                    avg_e[b] <= e_fermi + froz_margin_above and
+                    classification.category[b] != 'excluded'):
+                    classification.category[b] = 'frozen'
+            classification.frozen_indices = np.where(
+                classification.category == 'frozen')[0]
+            classification.disent_indices = np.where(
+                classification.category == 'disent')[0]
+            # Recompute windows with updated classification
+            windows = determine_windows(classification, eigenvalues, e_fermi)
+            print(f"  Energy-range frozen bands: {len(classification.frozen_indices)}")
+
+    # Apply results to engine
+    engine.num_wann = num_wann
+
+    # Selected bands = frozen + disentangle
+    all_active = np.union1d(classification.frozen_indices,
+                            classification.disent_indices)
+    if len(all_active) == 0:
+        print("ERROR: No bands classified as frozen or disentangle!")
+        sys.exit(1)
+
+    # Ensure band ratio >= 1.5 for adequate disentanglement freedom
+    min_ratio = 1.5
+    min_bands = max(int(np.ceil(num_wann * min_ratio)), num_wann + 1)
+    if len(all_active) < min_bands:
+        nb = eigenvalues.shape[1]
+        # Find outer window bounds from current active set
+        if windows.dis_win_min is not None:
+            win_lo = windows.dis_win_min
+            win_hi = windows.dis_win_max
+        else:
+            active_eigs = eigenvalues[:, all_active]
+            win_lo = float(np.min(active_eigs)) - 2.0
+            win_hi = float(np.max(active_eigs)) + 2.0
+
+        # Expand outer window to include more bands above
+        candidates = []
+        for b in range(nb):
+            if b in set(all_active):
+                continue
+            band_eigs = eigenvalues[:, b]
+            # Include bands that overlap with expanded outer window
+            if np.any((band_eigs >= win_lo) & (band_eigs <= win_hi + 10.0)):
+                avg_e_b = np.mean(band_eigs)
+                candidates.append((avg_e_b, b))
+
+        # Sort candidates by energy (prefer bands near the active set)
+        candidates.sort(key=lambda x: x[0])
+        for _, b in candidates:
+            all_active = np.union1d(all_active, [b])
+            if len(all_active) >= min_bands:
+                break
+
+        # Update outer window to encompass all active bands
+        active_eigs = eigenvalues[:, all_active]
+        windows.dis_win_min = float(np.min(active_eigs)) - 2.0
+        windows.dis_win_max = float(np.max(active_eigs)) + 2.0
+
+        ratio = len(all_active) / num_wann
+        print(f"\n  Expanded band set to {len(all_active)} bands "
+              f"(ratio {ratio:.2f}) for adequate disentanglement")
+
+    engine.selected_band_indices = all_active
+
+    # Store disentanglement windows (relative to E_F for win_file)
+    if windows.dis_win_min is not None and len(all_active) > num_wann:
+        engine._dis_win = (windows.dis_win_min - e_fermi,
+                           windows.dis_win_max - e_fermi)
+    else:
+        engine._dis_win = None
+
+    if windows.dis_froz_min is not None:
+        engine._dis_froz = (windows.dis_froz_min - e_fermi,
+                            windows.dis_froz_max - e_fermi)
+    else:
+        engine._dis_froz = None
+
+    engine._num_bands_for_win = len(all_active)
+
+    # Store full target mask for SVD-based PDWF Amn generation
+    # (projects onto ALL target AOs, then SVD selects optimal num_wann subspace)
+    engine.pdwf_target_mask = target_mask
+    engine.selected_orbital_indices = None  # Not used with PDWF Amn
+
+    if windows.dis_win_min is not None and len(all_active) > num_wann:
+        ratio = len(all_active) / num_wann
+        print(f"\n  Disentanglement enabled:")
+        print(f"    num_wann:  {num_wann}")
+        print(f"    num_bands: {len(all_active)} (ratio {ratio:.2f})")
+        if windows.dis_froz_min is not None:
+            print(f"    frozen:    [{windows.dis_froz_min - e_fermi:+.1f}, "
+                  f"{windows.dis_froz_max - e_fermi:+.1f}] eV (rel E_F)")
+        print(f"    outer:     [{windows.dis_win_min - e_fermi:+.1f}, "
+              f"{windows.dis_win_max - e_fermi:+.1f}] eV (rel E_F)")
+    else:
+        print(f"\n  No disentanglement needed: {num_wann} bands selected")
+
+    # Set iteration counts for proper convergence
+    # With SVD-based PDWF Amn, disentanglement converges fast (200 iters)
+    # MLWF needs more iterations for proper localization (2000 iters)
+    if engine._override_num_iter is None:
+        engine._override_num_iter = 2000
+    if engine._override_dis_num_iter is None:
+        engine._override_dis_num_iter = 200
 
 
 def _apply_method_direct(engine, args, has_soc, params):
@@ -455,7 +666,7 @@ def _infer_projections(atoms, num_wann, has_soc):
     Tries to match num_wann to standard orbital sets (per atom × spinor_factor):
       - s:     1 orbital per atom
       - p:     3 orbitals per atom
-      - sp3:   4 orbitals per atom
+      - s+p:   4 orbitals per atom (l=0;l=1, NOT sp3 hybrids)
       - d:     5 orbitals per atom
       - s+p+d: 9 orbitals per atom
 
@@ -487,9 +698,10 @@ def _infer_projections(atoms, num_wann, has_soc):
         print(f"  Auto-inferred projections: {projections}")
         return projections
 
-    # Try s+p (sp3): 4 per atom
+    # Try s+p: 4 per atom (use l=0;l=1 not sp3 to avoid imposing
+    # tetrahedral hybridization geometry on the initial guess)
     if orb_per_atom == 4:
-        projections = [f"{e}:sp3" for e in elements]
+        projections = [f"{e}:l=0;l=1" for e in elements]
         print(f"  Auto-inferred projections: {projections}")
         return projections
 
@@ -882,23 +1094,12 @@ def stage1_create_win(args):
         matrix_size = H_full_list[0][1].shape[0]
         print(f"✓ Created {matrix_size}×{matrix_size} SOC matrices")
     else:
-        # For non-SOC, create the (R_cartesian, matrix) list format manually
-        H_full_list = []
-        S_full_list = []
-
-        for R_int, H_mats in H_R_dict.items():
-            # Convert integer R to Cartesian
-            R_cart = lattice_vectors.T @ np.array(R_int)
-            # Use spin channel 0 (or average if multiple)
-            H_mat = list(H_mats.values())[0] if isinstance(H_mats, dict) else H_mats
-            H_full_list.append((R_cart, H_mat))
-
-        for R_int, S_mat in S_R_dict.items():
-            R_cart = lattice_vectors.T @ np.array(R_int)
-            S_full_list.append((R_cart, S_mat))
-
+        # For non-SOC, symmetrize lower-triangular raw matrices using R/-R pairs
+        H_full_list, S_full_list = create_nonsoc_full_matrices(
+            H_R_dict, S_R_dict, lattice_vectors_list
+        )
         matrix_size = num_basis
-        print(f"✓ Created {matrix_size}×{matrix_size} matrices (no SOC)")
+        print(f"✓ Created {matrix_size}×{matrix_size} symmetrized matrices (no SOC)")
 
     # Prepare real-space matrices in the format engine expects
     print("\nStep 4: Preparing real-space matrices...")
@@ -988,6 +1189,8 @@ def stage1_create_win(args):
         _apply_method_symmetry(engine, args, has_soc, params, lines)
     elif args.method == 'direct':
         _apply_method_direct(engine, args, has_soc, params)
+    elif args.method in ('pdwf', 'auto'):
+        _apply_method_pdwf(engine, args, has_soc, lines)
     elif args.method == 'projectability':
         if args.window:
             print(f"Using explicit energy window: [{e_min:.2f}, {e_max:.2f}] eV")
@@ -1212,23 +1415,12 @@ def stage2_create_data_files(args):
         matrix_size = H_full_list[0][1].shape[0]
         print(f"✓ Created {matrix_size}×{matrix_size} SOC matrices")
     else:
-        # For non-SOC, create the (R_cartesian, matrix) list format manually
-        H_full_list = []
-        S_full_list = []
-
-        for R_int, H_mats in H_R_dict.items():
-            # Convert integer R to Cartesian
-            R_cart = lattice_vectors.T @ np.array(R_int)
-            # Use spin channel 0 (or average if multiple)
-            H_mat = list(H_mats.values())[0] if isinstance(H_mats, dict) else H_mats
-            H_full_list.append((R_cart, H_mat))
-
-        for R_int, S_mat in S_R_dict.items():
-            R_cart = lattice_vectors.T @ np.array(R_int)
-            S_full_list.append((R_cart, S_mat))
-
+        # For non-SOC, symmetrize lower-triangular raw matrices using R/-R pairs
+        H_full_list, S_full_list = create_nonsoc_full_matrices(
+            H_R_dict, S_R_dict, lattice_vectors_list
+        )
         matrix_size = num_basis
-        print(f"✓ Created {matrix_size}×{matrix_size} matrices (no SOC)")
+        print(f"✓ Created {matrix_size}×{matrix_size} symmetrized matrices (no SOC)")
 
     # Prepare real-space matrices
     print("\nStep 4: Preparing real-space matrices...")
@@ -1363,6 +1555,8 @@ def stage2_create_data_files(args):
         _apply_symmetry_aware_selection(engine, args, has_soc, lines)
     elif args.method == 'symmetry':
         _apply_method_symmetry(engine, args, has_soc, params, lines)
+    elif args.method in ('pdwf', 'auto'):
+        _apply_method_pdwf(engine, args, has_soc, lines)
     elif args.method == 'direct':
         _apply_method_direct(engine, args, has_soc, params)
     elif args.method == 'projectability':
@@ -1702,6 +1896,221 @@ def stage3_symmetrize_hr(args):
     print("=" * 80)
 
 
+def stage4_plot_bands(args):
+    """
+    Stage 4: Plot LCAO band structure with PDWF projectability coloring.
+
+    Computes eigenvalues along a high-symmetry k-path and generates a
+    two-panel plot with projectability coloring and projected DOS.
+    """
+    from lcao_wannier.band_plot import (
+        run_band_structure, parse_custom_kpath, get_kpath_for_lattice,
+        PlotConfig,
+    )
+    from lcao_wannier.basis_parser import parse_basis_shells, get_atom_list
+    from lcao_wannier.valence_config import (
+        build_target_mask, compute_num_wann, summarize_config,
+    )
+    from lcao_wannier.lcao_pdwf import (
+        compute_lowdin_projectability, classify_bands, determine_windows,
+        ClassificationParams, print_pdwf_summary,
+    )
+    from lcao_wannier.band_selection import estimate_fermi_energy
+
+    print("=" * 80)
+    print("STAGE 4: LCAO Band Structure Plot")
+    print("=" * 80)
+    print(f"Input file: {args.input}")
+    print(f"Seedname: {args.seedname}")
+    print()
+
+    # Check input file exists
+    if not os.path.exists(args.input):
+        print(f"ERROR: Input file not found: {args.input}")
+        sys.exit(1)
+
+    # ---- Parse Crystal23 output ----
+    print("Step 1: Parsing CRYSTAL/LCAO output file...")
+    print("-" * 80)
+
+    with open(args.input, 'r') as f:
+        lines = f.readlines()
+
+    params = parse_calculation_parameters(lines)
+    raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
+    lattice_vectors = np.array(lattice_vectors_list)
+
+    has_soc = params.has_soc
+    print(f"  Fermi energy: {params.fermi_energy if params.fermi_energy else 'Not found'}")
+    print(f"  K-grid: {params.k_grid}")
+    print(f"  SOC: {'Yes' if has_soc else 'No'}")
+
+    # Organize matrices
+    H_R_dict = {}
+    S_R_dict = {}
+    for mat_info in raw_matrices:
+        R = tuple(mat_info['lattice_vector'])
+        mat_type = mat_info['type']
+        data = mat_info['data']
+
+        if mat_type == 'overlap':
+            S_R_dict[R] = data
+        elif mat_type == 'fock':
+            spin_channel = mat_info.get('spin_channel', 0)
+            if R not in H_R_dict:
+                H_R_dict[R] = {}
+            H_R_dict[R][spin_channel] = data
+
+    # Create full matrices
+    if has_soc:
+        H_full_list, S_full_list = create_spin_block_matrices(
+            H_R_dict, S_R_dict, params.num_ao, lattice_vectors_list
+        )
+    else:
+        H_full_list, S_full_list = create_nonsoc_full_matrices(
+            H_R_dict, S_R_dict, lattice_vectors_list
+        )
+
+    real_space_matrices = prepare_real_space_matrices(
+        H_full_list, S_full_list, lattice_vectors
+    )
+    print(f"  {len(real_space_matrices)} R-vectors")
+
+    # ---- PDWF analysis on uniform grid (unless --no-pdwf) ----
+    target_mask = None
+    classification = None
+    windows = None
+    e_fermi = None
+
+    no_pdwf = getattr(args, 'no_pdwf', False)
+
+    if not no_pdwf:
+        print("\nStep 2: PDWF analysis on uniform grid...")
+        print("-" * 80)
+
+        shells, num_ao = parse_basis_shells(lines, num_atoms=params.num_atoms)
+        atoms = get_atom_list(shells)
+
+        kgrid = params.k_grid if params.k_grid else [6, 6, 6]
+        engine = Wannier90Engine(
+            real_space_matrices=real_space_matrices,
+            k_grid=kgrid,
+            lattice_vectors=lattice_vectors,
+        )
+        engine.solve_all_kpoints(parallel=not getattr(args, 'no_parallel', False),
+                                 validate_overlap=False)
+
+        nb = engine.num_orbitals
+        nk = engine.num_kpoints
+        print(f"  {nk} k-points, {nb} bands")
+
+        # Build target mask
+        target_mask = build_target_mask(shells, has_soc=has_soc, verbose=False)
+        matrix_size = engine.S_k_list[0].shape[0]
+        if len(target_mask) != matrix_size:
+            if len(target_mask) > matrix_size:
+                target_mask = target_mask[:matrix_size]
+            else:
+                extended = np.zeros(matrix_size, dtype=bool)
+                extended[:len(target_mask)] = target_mask
+                target_mask = extended
+
+        num_wann = compute_num_wann(atoms, has_soc=has_soc)
+        print(f"  num_wann = {num_wann}")
+        print(summarize_config(atoms, has_soc=has_soc))
+
+        # Fermi energy
+        eigenvalues = np.array(engine.eigenvalues_list)
+        if params.fermi_energy is not None:
+            e_fermi = params.fermi_energy
+        else:
+            e_fermi = estimate_fermi_energy(engine.eigenvalues_list, method='midgap')
+        print(f"  E_Fermi = {e_fermi:.4f} eV")
+
+        # PDWF classification
+        proj_grid = compute_lowdin_projectability(
+            engine.eigenvectors_list, engine.S_k_list, target_mask,
+        )
+        classification = classify_bands(
+            proj_grid, eigenvalues, num_wann,
+            ClassificationParams(
+                p_high=getattr(args, 'pdwf_p_high', 0.95),
+                p_low=getattr(args, 'pdwf_p_low', 0.10),
+                e_fermi=e_fermi,
+            ),
+        )
+        windows = determine_windows(classification, eigenvalues, e_fermi)
+        print_pdwf_summary(classification, windows, eigenvalues, e_fermi, [])
+    else:
+        print("\nStep 2: Skipping PDWF analysis (--no-pdwf)")
+        # Still need Fermi energy
+        if params.fermi_energy is not None:
+            e_fermi = params.fermi_energy
+        else:
+            # Quick solve to estimate Fermi energy
+            kgrid = params.k_grid if params.k_grid else [6, 6, 6]
+            engine = Wannier90Engine(
+                real_space_matrices=real_space_matrices,
+                k_grid=kgrid,
+                lattice_vectors=lattice_vectors,
+            )
+            engine.solve_all_kpoints(parallel=not getattr(args, 'no_parallel', False),
+                                     validate_overlap=False)
+            e_fermi = estimate_fermi_energy(engine.eigenvalues_list, method='midgap')
+        print(f"  E_Fermi = {e_fermi:.4f} eV")
+
+    # ---- Determine k-path ----
+    print("\nStep 3: Band structure computation...")
+    print("-" * 80)
+
+    kpath_spec = None
+    kpath_type = getattr(args, 'kpath', 'auto')
+
+    if kpath_type == 'custom':
+        custom_str = getattr(args, 'custom_kpath', None)
+        if custom_str is None:
+            print("ERROR: --custom-kpath required with --kpath custom")
+            sys.exit(1)
+        kpath_spec = parse_custom_kpath(custom_str, npts=getattr(args, 'npts', 60))
+    elif kpath_type != 'auto':
+        kpath_spec = get_kpath_for_lattice(kpath_type, npts=getattr(args, 'npts', 60))
+
+    # Plot configuration
+    energy_range = getattr(args, 'energy_range', None)
+    if energy_range is None:
+        energy_range = (-20.0, 25.0)
+    else:
+        energy_range = tuple(energy_range)
+
+    plot_config = PlotConfig(energy_range=energy_range)
+
+    # Output path
+    output_plot = getattr(args, 'output_plot', None)
+    if output_plot is None:
+        output_plot = f"{args.seedname}_bands.png"
+
+    # Run band structure
+    band_data = run_band_structure(
+        real_space_matrices=real_space_matrices,
+        lattice_vectors=lattice_vectors,
+        e_fermi=e_fermi,
+        output_path=output_plot,
+        kpath_spec=kpath_spec,
+        npts=getattr(args, 'npts', 60),
+        target_mask=target_mask,
+        classification=classification,
+        windows=windows,
+        config=plot_config,
+        seedname=args.seedname,
+        verbose=True,
+    )
+
+    print()
+    print("=" * 80)
+    print("STAGE 4 COMPLETE")
+    print("=" * 80)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="LCAO-to-Wannier90 Multi-Stage Workflow Script",
@@ -1766,9 +2175,10 @@ EXAMPLES:
     )
 
     # Required arguments
-    parser.add_argument('--stage', type=int, choices=[1, 2, 3], required=True,
+    parser.add_argument('--stage', type=int, choices=[1, 2, 3, 4], required=True,
                         help='Stage 1: Create .win | Stage 2: Create .eig/.amn/.mmn | '
-                             'Stage 3: Symmetrize wannier90_hr.dat')
+                             'Stage 3: Symmetrize wannier90_hr.dat | '
+                             'Stage 4: Plot band structure')
     parser.add_argument('--input', '-i', type=str, required=True,
                         help='Input CRYSTAL/LCAO output file')
     parser.add_argument('--seedname', '-s', type=str, required=True,
@@ -1786,9 +2196,11 @@ EXAMPLES:
 
     # Method selection
     parser.add_argument('--method', type=str,
-                        choices=['projectability', 'direct', 'symmetry'],
+                        choices=['projectability', 'direct', 'symmetry', 'pdwf', 'auto'],
                         default='projectability',
-                        help='Wannierization method (default: projectability)')
+                        help='Wannierization method (default: projectability). '
+                             'pdwf: LCAO-PDWF chemistry-grounded band selection. '
+                             'auto: try pdwf, fall back to projectability.')
     parser.add_argument('--proj-threshold', type=float, default=0.9,
                         help='Projectability threshold for band selection '
                              '(default: 0.9, used with --method projectability)')
@@ -1807,6 +2219,18 @@ EXAMPLES:
                         help='Projection orbital selection method: '
                              'weight (default, simple ranking) or '
                              'scdm (SCDM-L with QR column pivoting)')
+
+    # PDWF-specific options
+    parser.add_argument('--extended', action='store_true',
+                        help='Use extended valence config (include semi-core states). '
+                             'Used with --method pdwf or --method auto.')
+    parser.add_argument('--include-tm-p', action='store_true',
+                        help='Include p-channel for transition metals in standard mode. '
+                             'Used with --method pdwf or --method auto.')
+    parser.add_argument('--pdwf-p-high', type=float, default=0.95,
+                        help='PDWF frozen threshold (default: 0.95)')
+    parser.add_argument('--pdwf-p-low', type=float, default=0.10,
+                        help='PDWF excluded threshold (default: 0.10)')
 
     # Symmetry-aware selection for WannSym compatibility
     parser.add_argument('--symmetrize', action='store_true',
@@ -1837,6 +2261,30 @@ EXAMPLES:
                               help='Threshold for dropping small hoppings in '
                                    'symmetrized output (default: 1e-9)')
 
+    # Stage 4 arguments (band structure plot)
+    stage4_group = parser.add_argument_group('Stage 4 options',
+                                              'Band structure plotting')
+    stage4_group.add_argument('--kpath', type=str,
+                              choices=['auto', 'hexagonal_2d', 'hexagonal_3d',
+                                       'fcc', 'bcc', 'sc', 'custom'],
+                              default='auto',
+                              help='K-path type (default: auto-detect from lattice)')
+    stage4_group.add_argument('--npts', type=int, default=60,
+                              help='Number of k-points per segment (default: 60)')
+    stage4_group.add_argument('--energy-range', type=float, nargs=2,
+                              metavar=('E_MIN', 'E_MAX'), default=None,
+                              help='Energy range relative to E_F in eV '
+                                   '(default: -20 25)')
+    stage4_group.add_argument('--output-plot', type=str, default=None,
+                              help='Output plot filename '
+                                   '(default: {seedname}_bands.png)')
+    stage4_group.add_argument('--no-pdwf', action='store_true',
+                              help='Skip PDWF projectability coloring '
+                                   '(uniform color bands)')
+    stage4_group.add_argument('--custom-kpath', type=str, default=None,
+                              help='Custom k-path string: '
+                                   '"G:0,0,0;M:0.5,0,0;K:0.333,0.333,0;G:0,0,0"')
+
     args = parser.parse_args()
 
     # Execute appropriate stage
@@ -1846,6 +2294,8 @@ EXAMPLES:
         stage2_create_data_files(args)
     elif args.stage == 3:
         stage3_symmetrize_hr(args)
+    elif args.stage == 4:
+        stage4_plot_bands(args)
 
 
 if __name__ == '__main__':

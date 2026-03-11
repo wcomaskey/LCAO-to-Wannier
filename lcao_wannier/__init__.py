@@ -37,6 +37,7 @@ from .parser import (
     parse_atomic_basis_info,  # NEW
     parse_orbital_types,  # NEW
     create_spin_block_matrices,
+    create_nonsoc_full_matrices,
     fill_raw_matrix,
     is_hermitian,
     CalculationParameters,  # NEW
@@ -97,9 +98,14 @@ from .verification import (
 from .wannier90 import (
     write_eig_file,
     write_amn_file,
+    write_amn_file_pdwf,
     write_mmn_file,
     write_wannier90_files,
     compute_mmn_matrix,
+    compute_mmn_direct,
+    compute_mmn_lowdin,
+    precompute_lowdin_eigenvectors,
+    unitarize_mmn,
 )
 
 # Win file writer
@@ -109,10 +115,29 @@ from .win_file import (
     parse_atoms_from_crystal_output,
     Wannier90WinConfig,
     KPATH_HEXAGONAL_2D,
+    KPATH_HEXAGONAL_3D,
     KPATH_SQUARE_2D,
     KPATH_FCC,
     KPATH_BCC,
     KPATH_SIMPLE_CUBIC,
+)
+
+# Band structure plotting
+from .band_plot import (
+    run_band_structure,
+    compute_band_structure,
+    plot_band_structure,
+    text_band_summary,
+    generate_kpath,
+    detect_lattice_type,
+    kpath_from_win_format,
+    get_kpath_for_lattice,
+    parse_custom_kpath,
+    compute_path_projectability,
+    KPathSpec,
+    KPathResult,
+    BandStructureData,
+    PlotConfig,
 )
 
 from .band_selection import (
@@ -165,6 +190,39 @@ from .conditioning import (
     OverlapConditioningError,
 )
 
+# Valence configuration (PDWF)
+from .valence_config import (
+    get_valence_l,
+    get_num_target_orbitals,
+    compute_num_wann,
+    build_target_mask,
+    summarize_config,
+    VALENCE_CONFIG,
+    ELEMENT_SYMBOLS,
+    ELEMENT_Z,
+)
+
+# Basis parser (PDWF)
+from .basis_parser import (
+    parse_basis_shells,
+    get_atom_list,
+    ShellInfo,
+)
+
+# LCAO-PDWF core
+from .lcao_pdwf import (
+    compute_lowdin_projectability,
+    compute_matrix_sqrt,
+    classify_bands,
+    determine_windows,
+    check_frozen_interlopers,
+    check_band_count,
+    print_pdwf_summary,
+    ClassificationParams,
+    BandClassification,
+    WindowParameters,
+)
+
 # Irrep module
 from .irreps import (
     compute_little_group,
@@ -184,6 +242,7 @@ __all__ = [
     # Parser
     'parse_overlap_and_fock_matrices',
     'create_spin_block_matrices',
+    'create_nonsoc_full_matrices',
     'fill_raw_matrix',
     'is_hermitian',
     'parse_calculation_parameters',
@@ -229,18 +288,40 @@ __all__ = [
     # Wannier90
     'write_eig_file',
     'write_amn_file',
+    'write_amn_file_pdwf',
     'write_mmn_file',
     'write_wannier90_files',
     'compute_mmn_matrix',
+    'compute_mmn_direct',
+    'compute_mmn_lowdin',
+    'precompute_lowdin_eigenvectors',
+    'unitarize_mmn',
     'write_win_file',
     'create_win_config_from_engine',
     'parse_atoms_from_crystal_output',
     'Wannier90WinConfig',
     'KPATH_HEXAGONAL_2D',
+    'KPATH_HEXAGONAL_3D',
     'KPATH_SQUARE_2D',
     'KPATH_FCC',
     'KPATH_BCC',
     'KPATH_SIMPLE_CUBIC',
+
+    # Band structure plotting
+    'run_band_structure',
+    'compute_band_structure',
+    'plot_band_structure',
+    'text_band_summary',
+    'generate_kpath',
+    'detect_lattice_type',
+    'kpath_from_win_format',
+    'get_kpath_for_lattice',
+    'parse_custom_kpath',
+    'compute_path_projectability',
+    'KPathSpec',
+    'KPathResult',
+    'BandStructureData',
+    'PlotConfig',
 
     # Band selection
     'estimate_fermi_energy',
@@ -284,6 +365,33 @@ __all__ = [
     'validate_overlap_conditioning',
     'OverlapConditioningResult',
     'OverlapConditioningError',
+
+    # Valence config (PDWF)
+    'get_valence_l',
+    'get_num_target_orbitals',
+    'compute_num_wann',
+    'build_target_mask',
+    'summarize_config',
+    'VALENCE_CONFIG',
+    'ELEMENT_SYMBOLS',
+    'ELEMENT_Z',
+
+    # Basis parser (PDWF)
+    'parse_basis_shells',
+    'get_atom_list',
+    'ShellInfo',
+
+    # LCAO-PDWF core
+    'compute_lowdin_projectability',
+    'compute_matrix_sqrt',
+    'classify_bands',
+    'determine_windows',
+    'check_frozen_interlopers',
+    'check_band_count',
+    'print_pdwf_summary',
+    'ClassificationParams',
+    'BandClassification',
+    'WindowParameters',
 
     # Irreps
     'compute_little_group',
