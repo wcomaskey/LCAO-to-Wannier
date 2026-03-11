@@ -24,7 +24,7 @@ organize_matrices_by_lattice_vector : function
     Organize raw matrices by lattice vector and spin channel
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "William Comaskey"
 
 # Main engine class

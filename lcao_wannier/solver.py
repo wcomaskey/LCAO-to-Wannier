@@ -4,10 +4,9 @@ Eigenvalue Solver Module
 This module contains functions for solving the generalized eigenvalue problem
 H(k) C(k) = S(k) C(k) E(k) at each k-point.
 
-Supports three backends:
+Supports two backends:
 - Sequential: Python loop over k-points (dict-based Fourier)
 - Batched: Vectorized Fourier (einsum) + Python eigensolve loop
-- Fortran: Combined Fourier+eigensolve in Fortran with OpenMP parallelism
 """
 
 import numpy as np
@@ -18,12 +17,6 @@ from .fourier import (
     fourier_all_kpoints,
     StackedMatrices,
 )
-
-# Try to import Fortran kernel
-try:
-    from .fortran import HAS_FORTRAN, solve_all_kpoints_fortran
-except ImportError:
-    HAS_FORTRAN = False
 
 
 def solve_generalized_eigenvalue_problem(
@@ -307,10 +300,7 @@ def solve_all_kpoints_auto(
     backend: str = 'auto'
 ) -> Tuple[list, list, list]:
     """
-    Solve eigenvalue problems at all k-points using the best available backend.
-
-    Automatically selects between Fortran (OpenMP) and Python (batched vectorized)
-    based on availability.
+    Solve eigenvalue problems at all k-points using the batched vectorized backend.
 
     Parameters
     ----------
@@ -321,9 +311,7 @@ def solve_all_kpoints_auto(
     num_wann : int
         Number of bands to solve for
     backend : str
-        'auto' - Use Fortran if available, else Python batched
-        'fortran' - Force Fortran backend (error if not compiled)
-        'python' - Force Python batched backend
+        'auto' or 'python' - Use Python batched backend
 
     Returns
     -------
@@ -334,23 +322,8 @@ def solve_all_kpoints_auto(
     S_k_list : list of ndarrays
         Overlap matrices for each k-point
     """
-    use_fortran = False
-
-    if backend == 'auto':
-        use_fortran = HAS_FORTRAN
-    elif backend == 'fortran':
-        if not HAS_FORTRAN:
-            raise RuntimeError(
-                "Fortran backend requested but not compiled. "
-                "Run: python3 lcao_wannier/fortran/build_ext.py"
-            )
-        use_fortran = True
-    elif backend == 'python':
-        use_fortran = False
-    else:
-        raise ValueError(f"Unknown backend: {backend!r}. Use 'auto', 'fortran', or 'python'.")
-
-    if use_fortran:
-        return solve_all_kpoints_fortran(k_points, stacked, num_wann)
-    else:
-        return solve_all_kpoints_batched(k_points, stacked, num_wann)
+    if backend not in ('auto', 'python'):
+        raise ValueError(
+            f"Unknown backend: {backend!r}. Use 'auto' or 'python'."
+        )
+    return solve_all_kpoints_batched(k_points, stacked, num_wann)

@@ -16,21 +16,18 @@ import os
 import sys
 import tempfile
 
-# Add parent dir to path so wannsym can be imported
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from wannsym.hamiltonian import HamiltonianData
-from wannsym.orbital_rotations import (
+from lcao_wannier.wannsym.hamiltonian import HamiltonianData
+from lcao_wannier.wannsym.orbital_rotations import (
     orbital_rotation_s, orbital_rotation_p, orbital_rotation_d,
     orbital_rotation_f, orbital_rotation_t2g, orbital_rotation_pz,
     get_orbital_rotation, get_orbital_dim,
 )
-from wannsym.spinor import rmat_to_euler, spinor_dmatrix, get_spinor_dmatrix
-from wannsym.symmetry_ops import (
+from lcao_wannier.wannsym.spinor import rmat_to_euler, spinor_dmatrix, get_spinor_dmatrix
+from lcao_wannier.wannsym.symmetry_ops import (
     detect_symmetry, build_representation_matrices, compute_orbital_info,
     _clean_rotation_matrix,
 )
-from wannsym.symmetrize import (
+from lcao_wannier.wannsym.symmetrize import (
     symmetrize_hr, WannSymConfig,
     _hermitize, _apply_time_reversal,
 )

@@ -67,10 +67,18 @@ Thumbs.db
 # Generated plots
 *.pdf
 
-# Internal documentation/notes (not user-facing)
-BAND_SELECTION_METHODOLOGY.md
-SUCCESS_COMPLETE.md
-WANNIER90_MACOS_SEGFAULT.md
+# Log files
+*.log
+
+# Backup files
+*.bak
+*.old
+
+# Test output
+test_output/
+
+# Archived documentation
+docs/archive/
 
 # Development test scripts (not part of formal test suite)
 # The formal test suite in tests/ is tracked

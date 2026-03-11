@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm>=6.2"]
+requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lcao-wannier"
-version = "1.2.0"
+version = "1.3.0"
 description = "A computational engine for converting LCAO calculations to Wannier90 format"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Computational Materials Science Team"}
+    {name = "William Comaskey"}
 ]
 keywords = ["wannier", "lcao", "computational-chemistry", "materials-science", "dft"]
 classifiers = [
@@ -20,11 +20,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "numpy>=1.20.0",
@@ -32,14 +32,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+symmetry = ["spglib>=2.0"]
+plot = ["matplotlib>=3.3.0"]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
     "matplotlib>=3.3.0",
+    "spglib>=2.0",
 ]
 docs = [
     "sphinx>=4.0",
     "sphinx-rtd-theme>=0.5",
+]
+all = [
+    "spglib>=2.0",
+    "matplotlib>=3.3.0",
 ]
 
 [project.urls]
@@ -47,6 +54,12 @@ Homepage = "https://github.com/wcomaskey/lcao-wannier"
 Documentation = "https://lcao-wannier.readthedocs.io"
 Repository = "https://github.com/wcomaskey/lcao-wannier"
 "Bug Tracker" = "https://github.com/wcomaskey/lcao-wannier/issues"
+
+[project.scripts]
+lcao2wannier = "lcao_wannier.cli:cli_main"
+
+[tool.setuptools]
+py-modules = ["lcao_to_wannier90"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

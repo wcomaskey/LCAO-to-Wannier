@@ -1614,7 +1614,7 @@ def stage3_symmetrize_hr(args):
       - CRYSTAL output file (for crystal structure and orbital types)
       - wannier90_hr.dat (from Wannier90 run after Stage 2)
     """
-    from wannsym import symmetrize_hr, HamiltonianData, WannSymConfig
+    from lcao_wannier.wannsym import symmetrize_hr, HamiltonianData, WannSymConfig
     from lcao_wannier.symmetry import get_orbital_structure_from_crystal
 
     print("=" * 80)

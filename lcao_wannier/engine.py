@@ -15,7 +15,6 @@ from .solver import (
     solve_all_kpoints_parallel,
     solve_all_kpoints_batched,
     solve_all_kpoints_auto,
-    HAS_FORTRAN,
 )
 from .fourier import stack_real_space_matrices
 from .wannier90 import write_wannier90_files
@@ -323,12 +322,9 @@ class Wannier90Engine:
         solve_num_bands = self.num_orbitals
 
         # Determine which backend to use
-        use_auto = (backend == 'auto' and HAS_FORTRAN) or backend == 'fortran'
-
-        if use_auto or (not parallel):
-            # Use auto dispatch (Fortran+OpenMP if available, else batched Python)
-            backend_name = "Fortran+OpenMP" if (HAS_FORTRAN and backend != 'python') else "Batched vectorized"
-            print(f"Mode: {backend_name}")
+        if not parallel or backend in ('auto', 'python'):
+            # Use batched vectorized backend
+            print(f"Mode: Batched vectorized")
             eig_list, evec_list, sk_list = solve_all_kpoints_auto(
                 self.kpoints,
                 self._stacked,
