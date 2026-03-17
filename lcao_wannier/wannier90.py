@@ -495,6 +495,7 @@ def write_amn_file_pdwf(
     band_indices: np.ndarray,
     num_kpoints: int,
     num_wann: int,
+    equiv_groups_full: Optional[List[List[Tuple[int, int]]]] = None,
 ) -> None:
     """
     Write the .amn file using PDWF target subspace projection via SVD.
@@ -545,6 +546,11 @@ def write_amn_file_pdwf(
             P_k = S_k @ C_k  # (num_orbitals, num_bands_all)
             A_full = P_k[np.ix_(target_indices, band_indices)].T  # (num_bands, num_target)
 
+            # Symmetrize before SVD if equiv_groups provided
+            if equiv_groups_full:
+                # Transpose to (num_target, num_bands), symmetrize rows, transpose back
+                A_full = symmetrize_amn_matrix(A_full.T, equiv_groups_full).T
+
             # SVD to find optimal num_wann-dimensional projection
             U, sigma, Vh = np.linalg.svd(A_full, full_matrices=False)
             # A_optimal = U[:, :num_wann] @ diag(sigma[:num_wann])
@@ -560,6 +566,128 @@ def write_amn_file_pdwf(
                     )
 
 
+def symmetrize_amn_matrix(
+    A_k: np.ndarray,
+    equiv_groups: List[List[Tuple[int, int]]],
+) -> np.ndarray:
+    """
+    Symmetrize AMN projection matrix by averaging over equivalent Wannier atoms.
+
+    For each group of equivalent atoms (e.g. B1, B2 in MgB2), replaces each
+    atom's projection block with the average of all atoms' blocks in the group.
+    This ensures symmetry-equivalent atoms produce identical projections.
+
+    Parameters
+    ----------
+    A_k : ndarray, shape (num_proj, num_bands)
+        Projection matrix at one k-point.
+    equiv_groups : list of list of (start, count) tuples
+        Each group is a list of (row_start, num_orbs) pairs identifying the
+        rows of A_k belonging to each equivalent atom in the group.
+        Atoms in the same group must have the same num_orbs.
+
+    Returns
+    -------
+    A_sym : ndarray, shape (num_proj, num_bands)
+        Symmetrized projection matrix.
+    """
+    A_sym = A_k.copy()
+    for group in equiv_groups:
+        if len(group) <= 1:
+            continue
+        # Average the blocks
+        n_orbs = group[0][1]
+        avg = np.zeros((n_orbs, A_k.shape[1]), dtype=A_k.dtype)
+        for start, count in group:
+            assert count == n_orbs, f"Equivalent atoms have different orbital counts: {count} vs {n_orbs}"
+            avg += A_k[start:start + count, :]
+        avg /= len(group)
+        # Write back
+        for start, count in group:
+            A_sym[start:start + count, :] = avg
+    return A_sym
+
+
+def build_equiv_groups_from_spglib(
+    orbital_indices: np.ndarray,
+    basis_atom_map: np.ndarray,
+    atom_positions_frac: np.ndarray,
+    atom_numbers: np.ndarray,
+    lattice_vectors: np.ndarray,
+    tolerance: float = 1e-5,
+) -> List[List[Tuple[int, int]]]:
+    """
+    Build equivalent atom groups for AMN symmetrization using spglib.
+
+    Groups atoms that are symmetry-equivalent (same Wyckoff position) and
+    returns their positions within the projection orbital index array.
+
+    Parameters
+    ----------
+    orbital_indices : ndarray
+        Indices of selected projection orbitals in the full AO basis.
+    basis_atom_map : ndarray
+        Maps each AO index to its atom index.
+    atom_positions_frac : ndarray, shape (natom, 3)
+        Fractional coordinates of all atoms.
+    atom_numbers : ndarray
+        Atomic numbers for each atom.
+    lattice_vectors : ndarray, shape (3, 3)
+        Lattice vectors (rows).
+    tolerance : float
+        spglib symmetry tolerance.
+
+    Returns
+    -------
+    equiv_groups : list of list of (start, count) tuples
+        Groups of equivalent atoms with their row ranges in the projection matrix.
+    """
+    import spglib
+
+    cell = (lattice_vectors, atom_positions_frac, atom_numbers)
+    dataset = spglib.get_symmetry_dataset(cell, symprec=tolerance)
+    if dataset is None:
+        return []
+
+    # equivalent_atoms[i] = index of the representative atom for atom i
+    equiv_atoms = dataset['equivalent_atoms']
+
+    # Map projection orbital indices to atoms
+    proj_atoms = basis_atom_map[orbital_indices]
+
+    # Find unique atoms in the projection set
+    unique_proj_atoms = np.unique(proj_atoms)
+
+    # Group by equivalence class
+    from collections import defaultdict
+    equiv_classes = defaultdict(list)
+    for atom_idx in unique_proj_atoms:
+        rep = equiv_atoms[atom_idx]
+        equiv_classes[rep].append(atom_idx)
+
+    # Build (start, count) pairs for each atom's block in the projection matrix
+    groups = []
+    for rep, atom_list in equiv_classes.items():
+        if len(atom_list) <= 1:
+            continue
+        group = []
+        for atom_idx in atom_list:
+            mask = proj_atoms == atom_idx
+            indices_in_proj = np.where(mask)[0]
+            if len(indices_in_proj) == 0:
+                continue
+            start = indices_in_proj[0]
+            count = len(indices_in_proj)
+            # Verify contiguous
+            assert np.all(indices_in_proj == np.arange(start, start + count)), \
+                f"Orbitals for atom {atom_idx} are not contiguous in projection matrix"
+            group.append((start, count))
+        if len(group) > 1:
+            groups.append(group)
+
+    return groups
+
+
 def write_amn_file_lcao(
     filename: str,
     eigenvectors_list: List[np.ndarray],
@@ -567,7 +695,8 @@ def write_amn_file_lcao(
     orbital_indices: np.ndarray,
     band_indices: np.ndarray,
     num_kpoints: int,
-    num_wann: int
+    num_wann: int,
+    equiv_groups: Optional[List[List[Tuple[int, int]]]] = None,
 ) -> None:
     """
     Write the .amn file for LCAO methods with non-orthogonal basis correction.
@@ -620,6 +749,10 @@ def write_amn_file_lcao(
 
             # Extract selected orbitals (rows) and selected bands (columns)
             A_k = P_k[np.ix_(orbital_indices, band_indices)]  # Shape: (num_proj, num_bands)
+
+            # Symmetrize if equiv_groups provided
+            if equiv_groups:
+                A_k = symmetrize_amn_matrix(A_k, equiv_groups)
 
             # Write elements: loop over bands m, then projectors n
             # Wannier90 format: band_idx  wannier_idx  kpoint_idx  Re(A)  Im(A)
@@ -825,6 +958,9 @@ def write_mmn_file_lcao(
             if verbose:
                 print(f"  WARNING: S_k_list not provided, falling back to midpoint method")
         method_name = "Direct Real-Space" if use_direct_method else "Symmetric Midpoint"
+        # Apply band selection for midpoint path (Lowdin does this in precompute_lowdin_eigenvectors)
+        if band_indices is not None:
+            eigenvectors_list = [C[:, band_indices] for C in eigenvectors_list]
 
     with open(filename, 'w') as f:
         # Write header

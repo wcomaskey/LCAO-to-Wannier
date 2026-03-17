@@ -1578,11 +1578,39 @@ def stage2_create_data_files(args):
     print(f"\nStep 9: Writing data files using {nnkp_file} neighbors...")
     print("-" * 80)
 
+    # Prepare AMN symmetrization data if requested
+    amn_sym_kwargs = {}
+    if getattr(args, 'symmetrize_amn', False):
+        try:
+            atoms_result = parse_atoms_from_crystal_output(lines)
+            atoms_list_sym, _ = atoms_result
+            atom_syms = [sym for sym, _ in atoms_list_sym]
+            _SYMBOL_TO_Z = {
+                'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8,
+                'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15,
+                'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22,
+                'V': 23, 'Cr': 24, 'Mn': 25, 'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29,
+                'Zn': 30, 'Ga': 31, 'Ge': 32, 'As': 33, 'Se': 34, 'Br': 35, 'Kr': 36,
+                'Rb': 37, 'Sr': 38, 'Y': 39, 'Zr': 40, 'Nb': 41, 'Mo': 42, 'Tc': 43,
+                'Ru': 44, 'Rh': 45, 'Pd': 46, 'Ag': 47, 'Cd': 48, 'In': 49, 'Sn': 50,
+                'Sb': 51, 'Te': 52, 'I': 53, 'Xe': 54, 'Cs': 55, 'Ba': 56, 'La': 57,
+                'Ce': 58, 'Bi': 83,
+            }
+            amn_sym_kwargs = {
+                'symmetrize_amn': True,
+                'atom_positions_frac': np.array([pos for _, pos in atoms_list_sym]),
+                'atom_numbers': np.array([_SYMBOL_TO_Z.get(s, 0) for s in atom_syms]),
+            }
+            print(f"  AMN symmetrization enabled ({len(atoms_list_sym)} atoms)")
+        except Exception as e:
+            print(f"  ⚠ Cannot symmetrize AMN: {e}")
+
     # Write only the data files, not .win (already exists)
     engine.write_files(
         verbose=True,
         write_win=False,  # Don't overwrite .win
         use_nnkp=True,    # Use .nnkp neighbors (CRITICAL!)
+        **amn_sym_kwargs,
     )
 
     print()
@@ -2243,6 +2271,10 @@ EXAMPLES:
                         help='Orbital types for --symmetrize: '
                              'auto (default, detect from band structure), '
                              'p, sp, spd, etc.')
+    parser.add_argument('--symmetrize-amn', action='store_true',
+                        help='Symmetrize AMN projections by averaging over '
+                             'equivalent atoms. Gives Wannier90 a symmetric '
+                             'starting gauge without affecting other files.')
 
     # Stage 3 arguments (post-Wannierization symmetrization)
     stage3_group = parser.add_argument_group('Stage 3 options',

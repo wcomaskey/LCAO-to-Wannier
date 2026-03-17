@@ -662,7 +662,10 @@ class Wannier90Engine:
         projections: Optional[List[str]] = None,
         spinors: bool = True,
         bands_plot: bool = False,
-        kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None
+        kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None,
+        symmetrize_amn: bool = False,
+        atom_positions_frac: Optional[np.ndarray] = None,
+        atom_numbers: Optional[np.ndarray] = None,
     ) -> None:
         """
         Write all Wannier90 input files (.win, .eig, .amn, .mmn).
@@ -815,6 +818,39 @@ class Wannier90Engine:
 
         # Write .amn file (uses overlap-corrected LCAO projections)
         amn_file = f"{self.seedname}.amn"
+
+        # Build equiv groups for AMN symmetrization if requested
+        equiv_groups = None
+        equiv_groups_full = None
+        if symmetrize_amn:
+            if atom_positions_frac is not None and atom_numbers is not None and self.basis_atom_map is not None:
+                from .wannier90 import build_equiv_groups_from_spglib
+                if self.selected_orbital_indices is not None:
+                    equiv_groups = build_equiv_groups_from_spglib(
+                        self.selected_orbital_indices,
+                        self.basis_atom_map,
+                        atom_positions_frac,
+                        atom_numbers,
+                        self.lattice_vectors,
+                    )
+                if self.pdwf_target_mask is not None:
+                    target_indices = np.where(self.pdwf_target_mask)[0]
+                    equiv_groups_full = build_equiv_groups_from_spglib(
+                        target_indices,
+                        self.basis_atom_map,
+                        atom_positions_frac,
+                        atom_numbers,
+                        self.lattice_vectors,
+                    )
+                active_groups = equiv_groups_full or equiv_groups
+                if verbose and active_groups:
+                    n_groups = len(active_groups)
+                    group_sizes = [len(g) for g in active_groups]
+                    print(f"  AMN symmetrization: {n_groups} equiv group(s), sizes {group_sizes}")
+            else:
+                if verbose:
+                    print("  ⚠ Cannot symmetrize AMN: missing atom_positions_frac, atom_numbers, or basis_atom_map")
+
         if self.pdwf_target_mask is not None:
             # PDWF method: SVD-based projection onto full target subspace
             from .wannier90 import write_amn_file_pdwf
@@ -826,6 +862,7 @@ class Wannier90Engine:
                 band_indices,
                 self.num_kpoints,
                 self.num_wann,
+                equiv_groups_full=equiv_groups_full,
             )
             if verbose:
                 n_target = int(np.sum(self.pdwf_target_mask))
@@ -839,7 +876,8 @@ class Wannier90Engine:
                 self.selected_orbital_indices,
                 band_indices,
                 self.num_kpoints,
-                len(band_indices)
+                len(band_indices),
+                equiv_groups=equiv_groups,
             )
         else:
             write_amn_file(amn_file, eigenvectors_selected, S_k_selected, self.num_kpoints, len(band_indices))
@@ -881,8 +919,8 @@ class Wannier90Engine:
                 use_direct_method=True,
                 verbose=verbose,
                 stacked=self._stacked,
-                unitarize=False,  # Löwdin SVs bounded by [0,1], no unitarization needed
-                method='lowdin',
+                unitarize=False,
+                method='midpoint',
                 S_k_list=self.S_k_list,
                 band_indices=band_indices,
                 recip_lattice=self.recip_lattice,
