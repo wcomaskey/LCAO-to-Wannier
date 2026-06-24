@@ -117,6 +117,7 @@ class Wannier90WinConfig:
     fermi_energy: Optional[float] = None
     use_bloch_phases: bool = False
     guiding_centres: bool = False
+    site_symmetry: bool = False
 
     # Band structure path (optional)
     kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None
@@ -268,6 +269,8 @@ def write_win_file(
     lines.append(f"num_print_cycles = {config.num_print_cycles}")
     if config.guiding_centres:
         lines.append("guiding_centres = .true.")
+    if config.site_symmetry:
+        lines.append("site_symmetry = .true.")
     lines.append("")
 
     # Output options

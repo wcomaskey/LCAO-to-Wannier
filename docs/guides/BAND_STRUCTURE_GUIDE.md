@@ -1,5 +1,43 @@
 # Band Structure Plotting with Wannier90
 
+## Quick start — the auto-PDWF → band-comparison procedure
+
+The full procedure is driven from `lcao_to_wannier90.py`. For a material whose
+CRYSTAL output is `material.out`, using `--method auto` (PDWF band selection with
+automatic fallback to projectability):
+
+```bash
+# 1. Stage 1 — auto band selection + .win.  --bands-plot adds bands_plot = .true.
+#    and an auto-detected kpoint_path, so Wannier90 will write material_band.dat.
+python lcao_to_wannier90.py --stage 1 --input material.out --seedname material \
+    --method auto --bands-plot
+
+# 2. Wannier90 preprocessing (writes material.nnkp)
+wannier90.x -pp material
+
+# 3. Stage 2 — generate material.eig / .amn / .mmn
+python lcao_to_wannier90.py --stage 2 --input material.out --seedname material \
+    --method auto
+
+# 4. Wannier90 — localize and write material_band.dat
+#    (correctly interpolated, with the wsvec.dat Wannier–Seitz corrections)
+wannier90.x material
+
+# 5a. LCAO bands coloured by PDWF projectability (two-panel plot + projected DOS)
+python lcao_to_wannier90.py --stage 4 --input material.out --seedname material
+
+# 5b. LCAO-vs-Wannier overlay — read material_band.dat (do NOT hand-roll an
+#     hr.dat Fourier transform) and evaluate LCAO on the same k-points.
+#     See "Comparing with the LCAO reference" below and
+#     WANNIER_INTERPOLATION_PITFALL.md.
+```
+
+Useful overrides: Stage 4 takes `--kpath` / `--custom-kpath` to override the
+auto-detected path, and `--k-grid NX NY NZ` / `--fermi-energy EV` for slabs or
+level-shift-corrupted runs. Use `--method pdwf` to force strict PDWF (no fallback).
+
+The remainder of this guide walks through a worked Bismuth example.
+
 ## Settings Added to bismuth_final.win
 
 The following band structure settings have been added:
@@ -79,15 +117,25 @@ plt.savefig('bismuth_bandstructure.png', dpi=300)
 plt.show()
 ```
 
-### Method 3: Using the wannier90 Python API (if installed)
+### Method 3: Using this package's Wannier band reader (recommended)
+
+`lcao_wannier` ships a reader that parses Wannier90's `*_band.dat`, `*_band.kpt`,
+and `*_band.labelinfo.dat` — already carrying the correct Wannier–Seitz
+corrections that `wannier90.x` applied:
 
 ```python
-from wannier90 import w90
+from lcao_wannier import read_w90_band_outputs
+import matplotlib.pyplot as plt
 
-# Load results
-w90_data = w90.W90(seedname='bismuth_final')
-w90_data.plot_bands()
+w90 = read_w90_band_outputs('bismuth_final')
+for b in range(w90['num_wann']):
+    plt.plot(w90['distances'], w90['eigenvalues'][:, b], 'b-', lw=1.2)
+plt.xticks(w90['tick_positions'], w90['tick_labels'])
+plt.ylabel('Energy (eV)'); plt.axhline(0, ls=':', c='k')
+plt.savefig('bismuth_bands.png', dpi=300)
 ```
+
+(There is no `from wannier90 import w90` dependency — use the helper above.)
 
 ## File Formats
 
@@ -114,16 +162,36 @@ plot "bismuth_final_band.dat" using 1:2 with lines title "Band 1", \
      ...
 ```
 
-## Comparing with DFT Bands
+## Comparing with the LCAO reference
 
-To compare your Wannier-interpolated bands with the original DFT calculation:
+To check that the Wannier model reproduces the LCAO band structure, overlay
+Wannier90's interpolated bands on the LCAO bands evaluated **at the same
+k-points**:
 
-1. **Generate DFT bands** along the same path in CRYSTAL
-2. **Plot both** on the same graph:
-   - Wannier bands: solid lines
-   - DFT bands: circles or dots
+```python
+from lcao_wannier import read_w90_band_outputs, compute_band_structure
 
-Good agreement indicates your Wannier functions accurately represent the electronic structure!
+w90 = read_w90_band_outputs('bismuth_final')        # Wannier bands (wsvec-correct)
+
+# Evaluate LCAO on exactly the k-points Wannier90 used:
+class _Path: pass
+kpath = _Path()
+kpath.kpoints_frac   = w90['kpoints_frac']
+kpath.distances      = w90['distances']
+kpath.tick_positions = w90['tick_positions']
+kpath.tick_labels    = w90['tick_labels']
+eig_lcao, _, _ = compute_band_structure(real_space_matrices, lattice_vectors, kpath)
+eig_lcao -= e_fermi          # W90's .eig is already E_F-centred; shift LCAO to match
+```
+
+Plot `w90['eigenvalues']` (solid) against `eig_lcao` (dots) on the shared
+`w90['distances']` x-axis and report the per-band RMS. Good agreement means the
+Wannier functions faithfully represent the target subspace.
+
+> **Do not** build the Wannier bands by Fourier-transforming `*_hr.dat` yourself
+> — on coarse k-grids that ignores the Wannier–Seitz corrections in `*_wsvec.dat`
+> and can inflate the RMS by orders of magnitude. Always read `*_band.dat`. See
+> **[WANNIER_INTERPOLATION_PITFALL.md](WANNIER_INTERPOLATION_PITFALL.md)**.
 
 ## Customizing the K-Path
 
@@ -167,4 +235,32 @@ Once you have good band structure:
 - Calculate **Fermi surface**
 - Calculate **density of states (DOS)**
 - Export to **WannierTools** for advanced analysis
+
+## ⚠️ Important: Wannier-band interpolation pitfall
+
+If you are comparing Wannier-interpolated bands against the LCAO
+reference, **read the Wannier bands from `{seedname}_band.dat`**
+(written by `wannier90.x` when `bands_plot = T`), not by
+Fourier-transforming `{seedname}_hr.dat` yourself. The naïve formula
+
+```python
+H(k) = Σ_R H(R) · exp(2πi k·R) / weight(R)
+```
+
+is wrong on coarse k-grids because it ignores the Wannier–Seitz cell
+boundary corrections that live in `{seedname}_wsvec.dat`. On a CrI3
+6×6×6 grid, ignoring `wsvec.dat` inflated the per-band RMS by ~750×.
+
+The package provides a correct helper:
+
+```python
+from lcao_wannier import read_w90_band_outputs
+
+w90 = read_w90_band_outputs('my_seedname')
+# w90['kpoints_frac'], w90['eigenvalues'], w90['distances'], …
+```
+
+See **[WANNIER_INTERPOLATION_PITFALL.md](WANNIER_INTERPOLATION_PITFALL.md)**
+for the full explanation and the list of legacy scripts that contain
+the deprecated FFT path.
 

@@ -9,7 +9,7 @@ target mask construction.
 import re
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from .valence_config import ELEMENT_Z, ELEMENT_SYMBOLS
 
@@ -143,47 +143,66 @@ def parse_basis_shells(lines: List[str], num_atoms: Optional[int] = None) -> Tup
     if not raw_shells:
         raise ValueError("No shells found in LOCAL ATOMIC FUNCTIONS BASIS SET section")
 
-    # Determine AO count from explicit shells
-    max_ao = max(ao_end for _, _, _, _, ao_end, _, _ in raw_shells)
-    num_ao_explicit = max_ao + 1
-
     # Handle symmetry-equivalent atoms.
     # Crystal23 lists basis functions only for irreducible atoms.
     # Equivalent atoms appear in the header but have no shells.
     # We replicate shells from a same-element template atom.
+    #
+    # IMPORTANT: CRYSTAL assigns AO indices in strict atom order
+    # (atom 0's AOs come before atom 1's, etc.), even though the BASIS SET
+    # block only prints explicit shells for symmetry-irreducible atoms.
+    # When atoms are interleaved (e.g. Cr1 explicit, Cr2 template, I3 explicit,
+    # I4..I8 templates), we must place each templated atom's AOs in the
+    # natural atom-index slot, not at the end. Otherwise the parser double-
+    # counts the "gap" left by skipped explicit AO indices.
     atoms_with_shells = set(a_idx for a_idx, _, _, _, _, _, _ in raw_shells)
 
-    # Build map: atom_index -> symbol for ALL atoms (including shell-less)
-    atom_symbol_map = {idx: sym for idx, sym in atoms_found}
+    # Build element -> template atom map (first explicit atom of each element)
+    element_template = {}
+    for a_idx, a_sym, _, _, _, _, _ in raw_shells:
+        if a_sym not in element_template:
+            element_template[a_sym] = a_idx
 
-    # Find atoms without shells that need replication
+    # Compute per-atom AO count:
+    #   - Explicit atoms: sum of (ao_end - ao_start + 1) over their shells
+    #   - Template atoms: copy the count from their element's template
+    atom_ao_counts: Dict[int, int] = {}
+    for a_idx, _, _, ao_s, ao_e, _, _ in raw_shells:
+        atom_ao_counts[a_idx] = atom_ao_counts.get(a_idx, 0) + (ao_e - ao_s + 1)
+
+    # Walk atoms in natural (index) order and assign start positions
+    sorted_atoms = sorted(atoms_found, key=lambda x: x[0])
+    atom_start_ao: Dict[int, int] = {}
+    current_ao = 0
+    for a_idx, a_sym in sorted_atoms:
+        atom_start_ao[a_idx] = current_ao
+        if a_idx in atom_ao_counts:
+            current_ao += atom_ao_counts[a_idx]
+        elif a_sym in element_template:
+            template_atom = element_template[a_sym]
+            current_ao += atom_ao_counts[template_atom]
+        # else: no template, atom gets 0 AOs (pathological, but keep going)
+    num_ao_explicit = current_ao
+
+    # Replicate template shells into non-explicit atoms using correct offsets
     atoms_needing_replication = [
         (idx, sym) for idx, sym in atoms_found
         if idx not in atoms_with_shells
     ]
 
     if atoms_needing_replication:
-        # Build template map: for each element, find an atom that has shells
-        element_template = {}
-        for a_idx, a_sym, _, _, _, _, _ in raw_shells:
-            if a_sym not in element_template:
-                element_template[a_sym] = a_idx
-
-        # Current AO count (where new AOs start)
-        next_ao = num_ao_explicit
-
         replicated = []
         for atom_new, atom_sym in atoms_needing_replication:
             template_atom = element_template.get(atom_sym)
             if template_atom is None:
                 continue  # No template found for this element
 
-            # Get template atom's AO range to compute offset
+            # Template atom's first AO (the shell's lowest ao_start)
             template_ao_min = min(
                 ao_s for a_idx, _, _, ao_s, _, _, _ in raw_shells
                 if a_idx == template_atom
             )
-            ao_offset = next_ao - template_ao_min
+            ao_offset = atom_start_ao[atom_new] - template_ao_min
 
             for (a_idx, a_sym, a_Z, ao_s, ao_e, l_v, is_sp) in raw_shells:
                 if a_idx == template_atom:
@@ -191,15 +210,7 @@ def parse_basis_shells(lines: List[str], num_atoms: Optional[int] = None) -> Tup
                                        ao_s + ao_offset, ao_e + ao_offset,
                                        l_v, is_sp))
 
-            # Advance next_ao past this atom's AOs
-            template_num_ao = sum(
-                ao_e - ao_s + 1 for a_idx, _, _, ao_s, ao_e, _, _ in raw_shells
-                if a_idx == template_atom
-            )
-            next_ao += template_num_ao
-
         raw_shells.extend(replicated)
-        num_ao_explicit = next_ao
 
     # Assign radial indices and build ShellInfo list
     radial_counter = {}  # (atom_index, l) -> count

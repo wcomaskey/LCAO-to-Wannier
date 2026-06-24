@@ -691,6 +691,87 @@ def text_band_summary(data: BandStructureData, output_dir: Optional[str] = None,
 
 # ---- High-level API ----
 
+def read_w90_band_outputs(seedname: str) -> Dict[str, np.ndarray]:
+    """Read Wannier90's pre-interpolated band-structure outputs.
+
+    Returns the eigenvalues, k-points (fractional), cumulative path
+    distances, and high-symmetry tick info that ``wannier90.x`` writes
+    when ``bands_plot = T`` is set. The eigenvalues are already
+    interpolated using ``wsvec.dat`` corrections, so they are the
+    canonical Wannier-interpolated bands on the chosen path.
+
+    Use this in preference to manually Fourier-transforming ``hr.dat``
+    yourself. Naïve ``Σ_R H(R) exp(2πi k·R) / weight(R)`` is **wrong**
+    for coarse k-grids because it double-counts R-vectors at the
+    Wannier–Seitz cell boundary that ``wsvec.dat`` accounts for
+    (see ``docs/guides/WANNIER_INTERPOLATION_PITFALL.md``).
+
+    Parameters
+    ----------
+    seedname : str
+        The Wannier90 seedname. The function expects to find
+        ``{seedname}_band.dat``, ``{seedname}_band.kpt``, and
+        ``{seedname}_band.labelinfo.dat`` in the current directory.
+
+    Returns
+    -------
+    dict with keys:
+        ``kpoints_frac``   : (nk, 3) ndarray of fractional k-coordinates
+        ``eigenvalues``    : (nk, num_wann) ndarray of W90 energies (eV)
+        ``distances``      : (nk,) ndarray of cumulative path distance
+        ``tick_positions`` : list[float] of high-symmetry positions
+        ``tick_labels``    : list[str] of high-symmetry labels (e.g. 'G', 'M')
+        ``num_wann``       : int
+
+    Notes
+    -----
+    Energies are in the frame W90 internally uses, which is whatever
+    frame ``{seedname}.eig`` was written in. If our Stage 2 wrote the
+    eig file shifted to ``E_F = 0`` (the default), then these
+    eigenvalues are likewise centered at 0 — do *not* subtract the
+    Fermi energy again when plotting.
+    """
+    band_data = np.loadtxt(f'{seedname}_band.dat')
+    k_col = band_data[:, 0]
+    e_col = band_data[:, 1]
+    reset = np.where(np.diff(k_col) < -1e-6)[0]
+    nk = (reset[0] + 1) if len(reset) else len(k_col)
+    num_wann = len(k_col) // nk
+    distances = k_col[:nk].copy()
+    eigenvalues = e_col.reshape(num_wann, nk).T
+
+    with open(f'{seedname}_band.kpt') as f:
+        nk_kpt = int(f.readline().split()[0])
+        raw = np.loadtxt(f, max_rows=nk_kpt)
+    if nk_kpt != nk:
+        raise RuntimeError(
+            f"{seedname}_band.kpt has {nk_kpt} k-points but "
+            f"{seedname}_band.dat has {nk}; W90 outputs are inconsistent."
+        )
+    kpoints_frac = raw[:, :3]
+
+    tick_labels: List[str] = []
+    tick_positions: List[float] = []
+    try:
+        with open(f'{seedname}_band.labelinfo.dat') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    tick_labels.append(parts[0])
+                    tick_positions.append(float(parts[2]))
+    except FileNotFoundError:
+        pass
+
+    return {
+        'kpoints_frac': kpoints_frac,
+        'eigenvalues': eigenvalues,
+        'distances': distances,
+        'tick_positions': tick_positions,
+        'tick_labels': tick_labels,
+        'num_wann': num_wann,
+    }
+
+
 def run_band_structure(
     real_space_matrices: list,
     lattice_vectors: np.ndarray,

@@ -1133,3 +1133,298 @@ def get_orbital_structure_from_crystal(
         result.append(shells)
 
     return result
+
+
+# ============================================================================
+# Phase 5: Site Symmetry (.dmn) Support
+# ============================================================================
+
+@dataclass
+class KPointSymmetryMap:
+    """K-point symmetry mapping for site_symmetry mode."""
+    ik2ir: np.ndarray       # (num_kpts,) maps full k-index -> irreducible k-index (0-based)
+    ir2ik: np.ndarray       # (nkptirr,) maps irreducible index -> full k-index (0-based)
+    kptsym: np.ndarray      # (nsymmetry, nkptirr) image of irr k under each symop (0-based)
+    iks2k: np.ndarray       # (num_kpts, nsymmetry) image of any k under each symop (0-based)
+    nkptirr: int
+    nsymmetry: int
+
+
+def compute_kpoint_symmetry_map(
+    kpoints: np.ndarray,
+    sym_info: 'SymmetryInfo',
+    tolerance: float = 1e-5
+) -> KPointSymmetryMap:
+    """
+    Compute k-point symmetry mapping arrays for site_symmetry .dmn file.
+
+    For each symmetry operation R and k-point k, finds which k-point index
+    corresponds to R^T @ k (mod reciprocal lattice). Identifies the irreducible
+    Brillouin zone and builds all mapping arrays.
+
+    Parameters
+    ----------
+    kpoints : ndarray (num_kpts, 3)
+        K-points in fractional coordinates.
+    sym_info : SymmetryInfo
+        Symmetry operations from detect_symmetry_operations().
+    tolerance : float
+        Tolerance for matching k-points (mod 1).
+
+    Returns
+    -------
+    KPointSymmetryMap
+        All k-point symmetry mapping arrays (0-based internally).
+    """
+    num_kpts = len(kpoints)
+    nsymmetry = len(sym_info.operations)
+
+    # Build iks2k[ik, isym] = index of R_isym^T @ k_ik in k-grid
+    iks2k = np.full((num_kpts, nsymmetry), -1, dtype=int)
+
+    for isym, op in enumerate(sym_info.operations):
+        R_frac = op.rotation_frac
+        for ik in range(num_kpts):
+            # K transforms contragrediently: k' = R^T @ k
+            kp = R_frac.T @ kpoints[ik]
+            # Find k' in k-grid (mod 1)
+            diff = kpoints - kp[np.newaxis, :]
+            diff -= np.round(diff)
+            dists = np.linalg.norm(diff, axis=1)
+            idx = np.argmin(dists)
+            if dists[idx] < tolerance:
+                iks2k[ik, isym] = idx
+            else:
+                raise RuntimeError(
+                    f"Symop {isym}: k-point {kpoints[ik]} maps to {kp} "
+                    f"which is not in the k-grid (min dist={dists[idx]:.2e})"
+                )
+
+    # Build irreducible k-points (same algorithm as pw2wannier90)
+    found = np.zeros(num_kpts, dtype=bool)
+    ir2ik_list = []
+    ik2ir = np.full(num_kpts, -1, dtype=int)
+
+    for ik in range(num_kpts):
+        if found[ik]:
+            continue
+        found[ik] = True
+        ir_idx = len(ir2ik_list)
+        ir2ik_list.append(ik)
+        ik2ir[ik] = ir_idx
+        for isym in range(nsymmetry):
+            ikp = iks2k[ik, isym]
+            if not found[ikp]:
+                found[ikp] = True
+                ik2ir[ikp] = ir_idx
+
+    ir2ik = np.array(ir2ik_list, dtype=int)
+    nkptirr = len(ir2ik)
+
+    # Build kptsym[isym, ir] = image of irr k-point ir under symop isym
+    kptsym = np.zeros((nsymmetry, nkptirr), dtype=int)
+    for ir in range(nkptirr):
+        ik = ir2ik[ir]
+        for isym in range(nsymmetry):
+            kptsym[isym, ir] = iks2k[ik, isym]
+
+    return KPointSymmetryMap(
+        ik2ir=ik2ir,
+        ir2ik=ir2ik,
+        kptsym=kptsym,
+        iks2k=iks2k,
+        nkptirr=nkptirr,
+        nsymmetry=nsymmetry
+    )
+
+
+def compute_d_matrix_wann(
+    sym_info: 'SymmetryInfo',
+    kpoints: np.ndarray,
+    ksym_map: KPointSymmetryMap,
+    protmat_list: list,
+    wann_orbital_indices: np.ndarray,
+    basis_atom_map: np.ndarray,
+    has_soc: bool = False
+) -> np.ndarray:
+    """
+    Compute the Wannier-space representation matrices d_matrix_wann.
+
+    d_matrix_wann(m, n, isym, ir) describes how trial projections transform:
+    |g_m(gk)> = sum_n D_wann_mn |g_n(k)>
+
+    Parameters
+    ----------
+    sym_info : SymmetryInfo
+        Symmetry operations.
+    kpoints : ndarray (num_kpts, 3)
+        K-points in fractional coordinates.
+    ksym_map : KPointSymmetryMap
+        K-point symmetry mapping.
+    protmat_list : list of ndarray
+        Representation matrices from build_representation_matrices().
+        Shape: (norbs, norbs) or (2*norbs, 2*norbs) with SOC.
+    wann_orbital_indices : ndarray
+        Indices of orbitals used as Wannier projections (0-based, into full basis).
+    basis_atom_map : ndarray
+        Maps basis function index -> atom index.
+    has_soc : bool
+        Whether the system has spin-orbit coupling.
+
+    Returns
+    -------
+    ndarray (num_wann, num_wann, nsymmetry, nkptirr)
+        Complex representation matrices for trial projections.
+    """
+    num_wann = len(wann_orbital_indices)
+    nsymmetry = ksym_map.nsymmetry
+    nkptirr = ksym_map.nkptirr
+
+    d_matrix_wann = np.zeros((num_wann, num_wann, nsymmetry, nkptirr),
+                             dtype=np.complex128)
+
+    for ir in range(nkptirr):
+        ik = ksym_map.ir2ik[ir]
+        k_frac = kpoints[ik]
+
+        for isym in range(nsymmetry):
+            op = sym_info.operations[isym]
+
+            # Extract WF subspace block from full protmat
+            # protmat[i, j] maps orbital j -> orbital i
+            full_protmat = protmat_list[isym]
+            wws = full_protmat[np.ix_(wann_orbital_indices, wann_orbital_indices)]
+
+            # Build phase matrix (diagonal)
+            # Phase for each WF column n: exp(2πi k · vec_shift[atom_of_wf_n])
+            phs = np.zeros((num_wann, num_wann), dtype=np.complex128)
+            for iw in range(num_wann):
+                orb_idx = wann_orbital_indices[iw]
+                atom_idx = basis_atom_map[orb_idx]
+                # vec_shift[atom_j] = R·τ_j + t - τ_{atom_map[j]} (lattice vector)
+                phase = 2.0 * np.pi * np.dot(op.vec_shift[atom_idx], k_frac)
+                phs[iw, iw] = np.exp(1j * phase)
+
+            # Also account for G-vector phase when Rk wraps around BZ
+            ik_gk = ksym_map.iks2k[ik, isym]
+            k_image = op.rotation_frac.T @ k_frac
+            G_shift = kpoints[ik_gk] - k_image
+            G_shift_round = np.round(G_shift)
+
+            if np.linalg.norm(G_shift - G_shift_round) > 1e-6:
+                warnings.warn(
+                    f"Non-integer G-shift at isym={isym}, ir={ir}: {G_shift}"
+                )
+
+            # G-vector phase: exp(2πi tvec · (R^T @ G))
+            # Following pw2wannier90: v2 = matmul(v1, sr) where v1 = k' - R@k
+            if np.linalg.norm(G_shift_round) > 1e-10:
+                # Phase from translation dotted with rotated G
+                v2 = G_shift_round @ op.rotation_frac
+                g_phase = np.exp(1j * 2.0 * np.pi * np.dot(op.translation, v2))
+                phs *= g_phase
+
+            d_matrix_wann[:, :, isym, ir] = phs @ wws
+
+    return d_matrix_wann
+
+
+def compute_d_matrix_band(
+    sym_info: 'SymmetryInfo',
+    kpoints: np.ndarray,
+    ksym_map: KPointSymmetryMap,
+    protmat_list: list,
+    eigenvectors_list: list,
+    S_k_list: list,
+    basis_atom_map: np.ndarray,
+    band_indices: np.ndarray = None,
+    has_soc: bool = False
+) -> np.ndarray:
+    """
+    Compute the band-space representation matrices d_matrix_band.
+
+    D_band(g, k)_{mn} = <psi_m(gk) | g | psi_n(k)>
+
+    In LCAO: D_band = C(gk)^dag S(gk) T(g,k) C(k)
+    where T(g,k)_{nu,mu} = protmat_{nu,mu} * exp(2pi i k . vec_shift[atom_of_mu])
+
+    Parameters
+    ----------
+    sym_info : SymmetryInfo
+        Symmetry operations.
+    kpoints : ndarray (num_kpts, 3)
+        K-points in fractional coordinates.
+    ksym_map : KPointSymmetryMap
+        K-point symmetry mapping.
+    protmat_list : list of ndarray
+        Representation matrices from build_representation_matrices().
+    eigenvectors_list : list of ndarray
+        LCAO eigenvectors C(k) at each k-point. Shape (norbs, nbands_total).
+    S_k_list : list of ndarray
+        Overlap matrices S(k). Shape (norbs, norbs).
+    basis_atom_map : ndarray
+        Maps basis function index -> atom index.
+    band_indices : ndarray, optional
+        Indices of selected bands (0-based). If None, use all bands.
+    has_soc : bool
+        Whether the system has spin-orbit coupling.
+
+    Returns
+    -------
+    ndarray (num_bands, num_bands, nsymmetry, nkptirr)
+        Complex representation matrices for Bloch states.
+    """
+    nsymmetry = ksym_map.nsymmetry
+    nkptirr = ksym_map.nkptirr
+    norbs = eigenvectors_list[0].shape[0]
+
+    if band_indices is not None:
+        num_bands = len(band_indices)
+    else:
+        num_bands = eigenvectors_list[0].shape[1]
+
+    d_matrix_band = np.zeros((num_bands, num_bands, nsymmetry, nkptirr),
+                             dtype=np.complex128)
+
+    for ir in range(nkptirr):
+        ik = ksym_map.ir2ik[ir]
+        k_frac = kpoints[ik]
+
+        # C(k) with band selection
+        if band_indices is not None:
+            C_k = eigenvectors_list[ik][:, band_indices]
+        else:
+            C_k = eigenvectors_list[ik]
+
+        for isym in range(nsymmetry):
+            op = sym_info.operations[isym]
+
+            # Find gk = R^T @ k (image k-point index)
+            ik_gk = ksym_map.iks2k[ik, isym]
+
+            # C(gk) and S(gk) with band selection
+            if band_indices is not None:
+                C_gk = eigenvectors_list[ik_gk][:, band_indices]
+            else:
+                C_gk = eigenvectors_list[ik_gk]
+            S_gk = S_k_list[ik_gk]
+
+            # Build T(g,k) = protmat * phase_columns
+            # Phase for each source orbital mu: exp(-2pi i k . vec_shift[atom_of_mu])
+            # The negative sign comes from the Bloch basis transformation:
+            # g|chi_mu(k)> = exp(-i gk.L_mu) protmat |chi_nu(gk)>
+            # where L_mu = vec_shift[atom_mu], and -gk.L = -k.L for inversion
+            protmat = protmat_list[isym].copy()
+            phase_vec = np.zeros(norbs, dtype=np.complex128)
+            for mu in range(norbs):
+                atom_idx = basis_atom_map[mu]
+                phase = -2.0 * np.pi * np.dot(op.vec_shift[atom_idx], k_frac)
+                phase_vec[mu] = np.exp(1j * phase)
+
+            # Apply phase column-wise: T_{nu,mu} = protmat_{nu,mu} * phase[mu]
+            T_gk = protmat * phase_vec[np.newaxis, :]
+
+            # D_band = C(gk)^dag @ S(gk) @ T(g,k) @ C(k)
+            d_matrix_band[:, :, isym, ir] = C_gk.conj().T @ S_gk @ T_gk @ C_k
+
+    return d_matrix_band

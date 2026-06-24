@@ -125,6 +125,7 @@ from .win_file import (
 # Band structure plotting
 from .band_plot import (
     run_band_structure,
+    read_w90_band_outputs,
     compute_band_structure,
     plot_band_structure,
     text_band_summary,
@@ -142,6 +143,7 @@ from .band_plot import (
 
 from .band_selection import (
     estimate_fermi_energy,
+    compute_fermi_level,
     analyze_band_window,
     print_band_analysis,
     check_frozen_continuity,
@@ -309,6 +311,7 @@ __all__ = [
 
     # Band structure plotting
     'run_band_structure',
+    'read_w90_band_outputs',
     'compute_band_structure',
     'plot_band_structure',
     'text_band_summary',
@@ -325,6 +328,7 @@ __all__ = [
 
     # Band selection
     'estimate_fermi_energy',
+    'compute_fermi_level',
     'analyze_band_window',
     'print_band_analysis',
     'check_frozen_continuity',

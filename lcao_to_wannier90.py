@@ -64,6 +64,91 @@ from lcao_wannier.lcao_pdwf import (
 # Threshold above which --method direct warns the user
 LARGE_BASIS_THRESHOLD = 200
 
+# Maximum allowed discrepancy between CRYSTAL-reported Fermi and
+# HOMO estimated from (eigenvalues, num_electrons). Beyond this, the
+# reported Fermi is deemed inconsistent with the printed H(R) matrices
+# (e.g. SPINLOCK+level-shifter quirk in CRYSTAL23 SOC outputs) and we
+# fall back to the electron-count estimate with a prominent warning.
+FERMI_FRAME_TOLERANCE_EV = 1.0
+
+
+def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
+    """
+    Compare the parsed Fermi energy against the HOMO estimated from
+    eigenvalues + electron count. Detects CRYSTAL SPINLOCK/level-shifter
+    frame mismatches where the Fermi and H(R) matrices end up in different
+    energy references.
+
+    If `--fermi-energy` was passed explicitly, trusts that and returns.
+    If the parsed Fermi disagrees with the electron-count estimate by
+    more than FERMI_FRAME_TOLERANCE_EV, replaces engine.e_fermi with the
+    estimate and prints a loud warning.
+
+    Must be called AFTER engine.solve_all_kpoints().
+    """
+    # User override always wins — they've made a conscious choice.
+    if getattr(args, 'fermi_energy', None) is not None:
+        return
+
+    # Can't sanity-check without a parsed Fermi and electron count.
+    if params.fermi_energy is None or params.num_electrons is None:
+        return
+
+    # Compute HOMO-based estimate from our eigenvalues.
+    # Spin degeneracy: SOC systems have spinor bands (1 electron/band);
+    # non-SOC systems have spatial bands (2 electrons/band in the
+    # non-spin-polarized case treated by our solver).
+    has_soc = getattr(params, 'has_soc', False) or getattr(engine, 'has_soc', False)
+    spin_deg = 1 if has_soc else 2
+    try:
+        estimated = estimate_fermi_energy(
+            engine.eigenvalues_list,
+            num_electrons=params.num_electrons,
+            method='electron_count',
+            spin_degeneracy=spin_deg,
+        )
+    except Exception as exc:
+        print(f"  ⚠ Could not run Fermi sanity check: {exc}")
+        return
+
+    discrepancy = abs(params.fermi_energy - estimated)
+    if discrepancy <= FERMI_FRAME_TOLERANCE_EV:
+        # Parsed and estimated agree — nothing to do.
+        return
+
+    # Discrepancy is large. Almost always means the CRYSTAL output had
+    # SPINLOCK active or a level-shifter-altered Fermi (e.g. two-component
+    # SOC runs with LOCKING - FERMI ENERGY ALTERED BY LEVEL SHIFTER).
+    stage_tag = f" ({stage_name})" if stage_name else ""
+    print()
+    print("!" * 78)
+    print(f"  ⚠  FERMI ENERGY FRAME MISMATCH DETECTED{stage_tag}")
+    print("!" * 78)
+    print(f"  Parsed from CRYSTAL output : {params.fermi_energy:+.4f} eV")
+    print(f"  Estimated from band filling: {estimated:+.4f} eV "
+          f"(N_electrons={params.num_electrons})")
+    print(f"  Discrepancy                : {discrepancy:.4f} eV "
+          f"(tolerance {FERMI_FRAME_TOLERANCE_EV} eV)")
+    print()
+    print("  The parsed Fermi and the printed H(R) matrices appear to live")
+    print("  in different energy reference frames. Common causes in CRYSTAL23:")
+    print("    - SPINLOCK active ('LOCKING - FERMI ENERGY ALTERED BY LEVEL")
+    print("       SHIFTER' in the output)")
+    print("    - 'EIGENVALUE LEVEL SHIFTING OF X HARTREE' applied but not")
+    print("       removed before the Fermi-energy header was written")
+    print("    - Two-component SOC SCF with an internal Fermi-bias field")
+    print()
+    print(f"  → Falling back to the electron-count estimate "
+          f"({estimated:+.4f} eV).")
+    print(f"  → To override this, re-run with: "
+          f"--fermi-energy <your_value_in_eV>")
+    print("!" * 78)
+    print()
+
+    # Apply the fallback to both params (used later in the stage) and engine.
+    params.fermi_energy = estimated
+    engine.e_fermi = estimated
+
 
 def _apply_method_projectability(engine, args, has_soc=False):
     """Apply Method 1: Smart projectability-based band selection."""
@@ -223,6 +308,24 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
     print(summarize_config(atoms, extended=extended,
                            include_tm_p=include_tm_p, has_soc=has_soc))
 
+    # Align target_mask to engine orbital dimension.
+    # parse_basis_shells may count more AOs than the H/S matrices contain
+    # (e.g. 336 vs 296 spatial AOs in CrI3), causing a mismatch after SOC
+    # doubling (672 vs 592). Truncate the spatial part to engine.num_orbitals//2.
+    eng_dim = engine.num_orbitals
+    mask_len_orig = len(target_mask)
+    if mask_len_orig != eng_dim:
+        if has_soc:
+            spatial_engine = eng_dim // 2
+            half_mask = mask_len_orig // 2
+            mask_spatial = target_mask[:half_mask][:spatial_engine]
+            target_mask = np.concatenate([mask_spatial, mask_spatial])
+        else:
+            target_mask = target_mask[:eng_dim]
+        print(f"    [Note] target_mask trimmed {mask_len_orig}->{eng_dim} "
+              f"(basis parser: {num_ao_spatial} spatial AOs, "
+              f"engine: {eng_dim // (2 if has_soc else 1)})")
+
     # Phase 3: Compute Lowdin projectability
     print("\n  Phase 3: Computing Lowdin projectability...")
     eigenvalues = np.array(engine.eigenvalues_list)
@@ -372,13 +475,17 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
     else:
         print(f"\n  No disentanglement needed: {num_wann} bands selected")
 
-    # Set iteration counts for proper convergence
-    # With SVD-based PDWF Amn, disentanglement converges fast (200 iters)
-    # MLWF needs more iterations for proper localization (2000 iters)
+    # Set iteration counts for proper convergence.
+    # Previous values (2000 / 200) regressed MgB2 PDWF from Ω_total = 8.09 Å²
+    # to 44.28 Å² — the assumption that "SVD-based PDWF Amn converges fast"
+    # is false in practice. Match projectability/symmetry defaults.
     if engine._override_num_iter is None:
-        engine._override_num_iter = 2000
+        engine._override_num_iter = 10000
     if engine._override_dis_num_iter is None:
-        engine._override_dis_num_iter = 200
+        engine._override_dis_num_iter = 5000
+    # Guiding centres keeps the initial Wannier centres anchored, critical for
+    # PDWF where the SVD-chosen subspace has weak initial localization.
+    engine._guiding_centres = True
 
 
 def _apply_method_direct(engine, args, has_soc, params):
@@ -1038,6 +1145,18 @@ def stage1_create_win(args):
         lines = f.readlines()
 
     params = parse_calculation_parameters(lines)
+    # Apply user --k-grid override (for memory-limited systems or 2D slabs)
+    if getattr(args, 'k_grid', None) is not None:
+        original_kgrid = params.k_grid
+        params.k_grid = tuple(args.k_grid)
+        print(f"  Overriding k-grid: {original_kgrid} -> {params.k_grid} "
+              f"(user --k-grid)")
+    # Apply user --fermi-energy override (bypass SPINLOCK/level-shift-corrupted value)
+    if getattr(args, 'fermi_energy', None) is not None:
+        original_fermi = params.fermi_energy
+        params.fermi_energy = float(args.fermi_energy)
+        print(f"  Overriding Fermi energy: {original_fermi} eV -> "
+              f"{params.fermi_energy} eV (user --fermi-energy)")
     raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
@@ -1162,6 +1281,12 @@ def stage1_create_win(args):
 
     engine.solve_all_kpoints(parallel=not args.no_parallel)
     print("✓ Eigenvalue problems solved")
+
+    # Sanity-check parsed Fermi vs HOMO from electron count. Auto-falls
+    # back to the electron-count estimate with a loud warning if the two
+    # disagree by > FERMI_FRAME_TOLERANCE_EV (CRYSTAL SPINLOCK/shift
+    # frame-mismatch detection).
+    _sanity_check_fermi_energy(engine, params, args, stage_name="Stage 1")
 
     # Estimate Fermi energy if needed
     if params.fermi_energy is None:
@@ -1359,6 +1484,18 @@ def stage2_create_data_files(args):
         lines = f.readlines()
 
     params = parse_calculation_parameters(lines)
+    # Apply user --k-grid override (for memory-limited systems or 2D slabs)
+    if getattr(args, 'k_grid', None) is not None:
+        original_kgrid = params.k_grid
+        params.k_grid = tuple(args.k_grid)
+        print(f"  Overriding k-grid: {original_kgrid} -> {params.k_grid} "
+              f"(user --k-grid)")
+    # Apply user --fermi-energy override (bypass SPINLOCK/level-shift-corrupted value)
+    if getattr(args, 'fermi_energy', None) is not None:
+        original_fermi = params.fermi_energy
+        params.fermi_energy = float(args.fermi_energy)
+        print(f"  Overriding Fermi energy: {original_fermi} eV -> "
+              f"{params.fermi_energy} eV (user --fermi-energy)")
     raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
@@ -1524,12 +1661,108 @@ def stage2_create_data_files(args):
         print(f"⚠ Warning: Could not parse atomic basis info: {e}")
         print("  MMN file will not have phase correction (may cause negative spreads!)")
 
+    # Set up site_symmetry attributes if requested
+    if getattr(args, 'site_symmetry', False):
+        try:
+            from lcao_wannier.parser import parse_orbital_types
+            from lcao_wannier.symmetry import get_orbital_structure_from_crystal
+
+            # Get fractional positions and atomic numbers
+            A_inv = np.linalg.inv(lattice_vectors.T)
+            atom_positions_frac = (A_inv @ atomic_info.atom_positions.T).T
+            # Wrap to [0, 1)
+            atom_positions_frac -= np.floor(atom_positions_frac)
+            engine.atom_positions_frac = atom_positions_frac
+
+            # Get atomic numbers from symbols
+            _SYMBOL_TO_Z = {
+                'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7,
+                'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13,
+                'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19,
+                'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23, 'Cr': 24, 'Mn': 25,
+                'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29, 'Zn': 30, 'Ga': 31,
+                'Ge': 32, 'As': 33, 'Se': 34, 'Br': 35, 'Kr': 36, 'Rb': 37,
+                'Sr': 38, 'Y': 39, 'Zr': 40, 'Nb': 41, 'Mo': 42, 'Tc': 43,
+                'Ru': 44, 'Rh': 45, 'Pd': 46, 'Ag': 47, 'Cd': 48, 'In': 49,
+                'Sn': 50, 'Sb': 51, 'Te': 52, 'I': 53, 'Xe': 54, 'Cs': 55,
+                'Ba': 56, 'La': 57, 'Hf': 72, 'Ta': 73, 'W': 74, 'Re': 75,
+                'Os': 76, 'Ir': 77, 'Pt': 78, 'Au': 79, 'Hg': 80, 'Tl': 81,
+                'Pb': 82, 'Bi': 83,
+            }
+            engine.atom_numbers = np.array([
+                _SYMBOL_TO_Z.get(s, 0) for s in atomic_info.atom_symbols
+            ])
+
+            # Get orbital types per atom
+            orbital_types_dict = parse_orbital_types(lines)
+            num_basis_per_atom = []
+            for iatom in range(atomic_info.num_atoms):
+                count = int(np.sum(atomic_info.basis_atom_map == iatom))
+                num_basis_per_atom.append(count)
+
+            orb_per_atom = get_orbital_structure_from_crystal(
+                orbital_types_dict, num_basis_per_atom, atomic_info.num_atoms
+            )
+
+            # Validate: total orbitals from structure must match actual basis
+            from lcao_wannier.symmetry import _orbital_dim
+            total_from_structure = sum(
+                _orbital_dim(ot) for atom_orbs in orb_per_atom for ot in atom_orbs
+            )
+            if total_from_structure != atomic_info.num_basis:
+                # Orbital dict may be misaligned for equivalent atoms
+                # Copy structure from first atom of same element
+                print(f"  ⚠ Orbital structure mismatch ({total_from_structure} vs "
+                      f"{atomic_info.num_basis}), fixing via equivalent-atom copying...")
+                fixed = [None] * atomic_info.num_atoms
+                for iatom in range(atomic_info.num_atoms):
+                    sym = atomic_info.atom_symbols[iatom]
+                    nbas = num_basis_per_atom[iatom]
+                    # Find first atom of same element with same basis count
+                    ref = None
+                    for jatom in range(iatom):
+                        if (atomic_info.atom_symbols[jatom] == sym
+                                and num_basis_per_atom[jatom] == nbas
+                                and fixed[jatom] is not None):
+                            ref = jatom
+                            break
+                    if ref is not None:
+                        fixed[iatom] = list(fixed[ref])
+                    else:
+                        fixed[iatom] = orb_per_atom[iatom]
+                orb_per_atom = fixed
+                # Re-validate
+                total_fixed = sum(
+                    _orbital_dim(ot) for atom_orbs in orb_per_atom for ot in atom_orbs
+                )
+                if total_fixed != atomic_info.num_basis:
+                    raise RuntimeError(
+                        f"Cannot fix orbital structure: {total_fixed} != {atomic_info.num_basis}"
+                    )
+                print(f"  ✓ Fixed orbital structure: {total_fixed} orbitals")
+
+            engine.orbital_types_per_atom = orb_per_atom
+            engine.has_soc = has_soc
+            print(f"✓ Set up site_symmetry data: {atomic_info.num_atoms} atoms, "
+                  f"orbital types: {engine.orbital_types_per_atom}")
+        except Exception as e:
+            print(f"ERROR: Cannot set up site_symmetry: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
     # Solve eigenvalue problems
     print("\nStep 7: Solving eigenvalue problems...")
     print("-" * 80)
 
     engine.solve_all_kpoints(parallel=not args.no_parallel)
     print("✓ Eigenvalue problems solved")
+
+    # Sanity-check parsed Fermi vs HOMO from electron count. Auto-falls
+    # back to the electron-count estimate with a loud warning if the two
+    # disagree by > FERMI_FRAME_TOLERANCE_EV (CRYSTAL SPINLOCK/shift
+    # frame-mismatch detection).
+    _sanity_check_fermi_energy(engine, params, args, stage_name="Stage 2")
 
     # Estimate Fermi energy if needed
     if params.fermi_energy is None:
@@ -1610,7 +1843,11 @@ def stage2_create_data_files(args):
         verbose=True,
         write_win=False,  # Don't overwrite .win
         use_nnkp=True,    # Use .nnkp neighbors (CRITICAL!)
+
         **amn_sym_kwargs,
+
+        site_symmetry=getattr(args, 'site_symmetry', False),
+
     )
 
     print()
@@ -1620,8 +1857,13 @@ def stage2_create_data_files(args):
     print(f"✓ Created: {args.seedname}.eig")
     print(f"✓ Created: {args.seedname}.amn")
     print(f"✓ Created: {args.seedname}.mmn")
+    if getattr(args, 'site_symmetry', False):
+        print(f"✓ Created: {args.seedname}.dmn (site symmetry)")
     print()
     print("All files generated with correct neighbor structure from .nnkp!")
+    if getattr(args, 'site_symmetry', False):
+        print("Note: site_symmetry = .true. should be added to the .win file")
+        print("  (or re-run Stage 1 with --site-symmetry)")
     print()
     print("NEXT STEP:")
     print(f"  Run Wannier90 to generate maximally localized Wannier functions:")
@@ -1965,6 +2207,18 @@ def stage4_plot_bands(args):
         lines = f.readlines()
 
     params = parse_calculation_parameters(lines)
+    # Apply user --k-grid override (for memory-limited systems or 2D slabs)
+    if getattr(args, 'k_grid', None) is not None:
+        original_kgrid = params.k_grid
+        params.k_grid = tuple(args.k_grid)
+        print(f"  Overriding k-grid: {original_kgrid} -> {params.k_grid} "
+              f"(user --k-grid)")
+    # Apply user --fermi-energy override (bypass SPINLOCK/level-shift-corrupted value)
+    if getattr(args, 'fermi_energy', None) is not None:
+        original_fermi = params.fermi_energy
+        params.fermi_energy = float(args.fermi_energy)
+        print(f"  Overriding Fermi energy: {original_fermi} eV -> "
+              f"{params.fermi_energy} eV (user --fermi-energy)")
     raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
@@ -2215,6 +2469,22 @@ EXAMPLES:
     # Optional arguments
     parser.add_argument('--window', type=float, nargs=2, metavar=('E_MIN', 'E_MAX'),
                         help='Energy window in eV relative to Fermi level (default: -5.0 3.0)')
+    parser.add_argument('--k-grid', type=int, nargs=3, metavar=('NX', 'NY', 'NZ'),
+                        default=None,
+                        help='Override Monkhorst-Pack k-grid (default: read from '
+                             'CRYSTAL output SHRINK FACT). Use to downsample a '
+                             'dense CRYSTAL k-grid for memory-limited systems '
+                             '(e.g., --k-grid 6 6 6 for CrI3 on 8-32 GB RAM). '
+                             'The k-grid must divide evenly into the R-vector '
+                             'set parsed from the LCAO output.')
+    parser.add_argument('--fermi-energy', type=float, default=None, metavar='EV',
+                        help='Override Fermi energy in eV (bypass CRYSTAL-reported '
+                             'value). Required when CRYSTAL SPINLOCK + LEVEL SHIFTER '
+                             'corrupts the reported FERMI ENERGY (see "LOCKING - '
+                             'FERMI ENERGY ALTERED BY LEVEL SHIFTER" in the LCAO '
+                             'output). Estimate from band count: for an insulator, '
+                             'set halfway between VBM and CBM; for a metal, use the '
+                             'middle of the occupied/empty transition.')
     parser.add_argument('--projections', type=str, nargs='+',
                         help='Wannier90 projection strings (default: random)')
     parser.add_argument('--bands-plot', action='store_true',
@@ -2259,6 +2529,12 @@ EXAMPLES:
                         help='PDWF frozen threshold (default: 0.95)')
     parser.add_argument('--pdwf-p-low', type=float, default=0.10,
                         help='PDWF excluded threshold (default: 0.10)')
+
+    # Site symmetry for Wannier90
+    parser.add_argument('--site-symmetry', action='store_true',
+                        help='Generate .dmn file and enable site_symmetry = .true. '
+                             'in Wannier90. Enforces symmetry during Wannierization '
+                             '(Sakuma, PRB 87, 235109, 2013). Used in Stage 2.')
 
     # Symmetry-aware selection for WannSym compatibility
     parser.add_argument('--symmetrize', action='store_true',

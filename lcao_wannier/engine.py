@@ -39,6 +39,50 @@ from .win_file import (
 )
 
 
+def _verify_d_matrices(d_wann, d_band, ksym_map, verbose=True):
+    """Verify sanity of D-matrices for site_symmetry .dmn file."""
+    nkptirr = ksym_map.nkptirr
+    nsymmetry = ksym_map.nsymmetry
+    max_err_wann = 0.0
+    max_err_band = 0.0
+    identity_err_wann = 0.0
+    identity_err_band = 0.0
+
+    for ir in range(nkptirr):
+        for isym in range(nsymmetry):
+            # Check unitarity: D†D ≈ I
+            Dw = d_wann[:, :, isym, ir]
+            err_w = np.linalg.norm(Dw.conj().T @ Dw - np.eye(Dw.shape[0]))
+            max_err_wann = max(max_err_wann, err_w)
+
+            Db = d_band[:, :, isym, ir]
+            err_b = np.linalg.norm(Db.conj().T @ Db - np.eye(Db.shape[0]))
+            max_err_band = max(max_err_band, err_b)
+
+            # Check identity symop
+            if isym == 0:
+                identity_err_wann = max(identity_err_wann,
+                    np.linalg.norm(Dw - np.eye(Dw.shape[0])))
+                identity_err_band = max(identity_err_band,
+                    np.linalg.norm(Db - np.eye(Db.shape[0])))
+
+    if verbose:
+        print(f"    D-matrix verification:")
+        print(f"      d_wann unitarity error: {max_err_wann:.2e}")
+        print(f"      d_band unitarity error: {max_err_band:.2e}")
+        print(f"      Identity symop error (wann): {identity_err_wann:.2e}")
+        print(f"      Identity symop error (band): {identity_err_band:.2e}")
+
+    if max_err_wann > 0.1:
+        warnings.warn(f"d_matrix_wann unitarity error large: {max_err_wann:.2e}")
+    if max_err_band > 0.1:
+        warnings.warn(f"d_matrix_band unitarity error large: {max_err_band:.2e}")
+    if identity_err_wann > 1e-6:
+        warnings.warn(f"d_matrix_wann identity error: {identity_err_wann:.2e}")
+    if identity_err_band > 1e-6:
+        warnings.warn(f"d_matrix_band identity error: {identity_err_band:.2e}")
+
+
 class Wannier90Engine:
     """
     Main computational engine for LCAO-to-Wannier90 conversion.
@@ -663,9 +707,13 @@ class Wannier90Engine:
         spinors: bool = True,
         bands_plot: bool = False,
         kpoint_path: Optional[List[Tuple[str, np.ndarray]]] = None,
+
         symmetrize_amn: bool = False,
         atom_positions_frac: Optional[np.ndarray] = None,
         atom_numbers: Optional[np.ndarray] = None,
+
+        site_symmetry: bool = False
+
     ) -> None:
         """
         Write all Wannier90 input files (.win, .eig, .amn, .mmn).
@@ -936,6 +984,82 @@ class Wannier90Engine:
             num_entries = self.num_kpoints * num_neighbors * len(band_indices) * len(band_indices)
             print(f"  ✓ {mmn_file}: {num_entries} matrix elements")
 
+        # Write .dmn file for site_symmetry mode
+        if site_symmetry:
+            from .symmetry import (
+                detect_symmetry_operations, build_representation_matrices,
+                compute_kpoint_symmetry_map, compute_d_matrix_wann,
+                compute_d_matrix_band
+            )
+            from .wannier90 import write_dmn_file
+
+            if verbose:
+                print(f"\n  Computing site symmetry data (.dmn)...")
+
+            # Get symmetry info
+            has_soc = getattr(self, 'has_soc', False)
+            atom_numbers = getattr(self, 'atom_numbers', None)
+            atom_positions_frac = getattr(self, 'atom_positions_frac', None)
+
+            if atom_positions_frac is None or atom_numbers is None:
+                raise RuntimeError(
+                    "site_symmetry requires atom_positions_frac and atom_numbers "
+                    "to be set on the engine."
+                )
+
+            sym_tolerance = getattr(self, 'sym_tolerance', 1e-3)
+            sym_info = detect_symmetry_operations(
+                self.lattice_vectors, atom_positions_frac, atom_numbers,
+                tolerance=sym_tolerance
+            )
+            if verbose:
+                print(f"    Space group: {sym_info.space_group}, "
+                      f"{sym_info.nsymm} symmetry operations")
+
+            # Get orbital types per atom
+            orbital_types_per_atom = getattr(self, 'orbital_types_per_atom', None)
+            if orbital_types_per_atom is None:
+                raise RuntimeError(
+                    "site_symmetry requires orbital_types_per_atom to be set on the engine."
+                )
+
+            # Build representation matrices (protmat)
+            protmat_list = build_representation_matrices(
+                sym_info, orbital_types_per_atom, has_soc=has_soc
+            )
+
+            # K-point symmetry mapping
+            ksym_map = compute_kpoint_symmetry_map(self.kpoints, sym_info)
+            if verbose:
+                print(f"    Irreducible k-points: {ksym_map.nkptirr}/{self.num_kpoints}")
+
+            # Determine Wannier orbital indices
+            wann_orbital_indices = self.selected_orbital_indices
+            if wann_orbital_indices is None:
+                wann_orbital_indices = np.arange(self.num_wann)
+
+            # Compute D-matrices
+            d_wann = compute_d_matrix_wann(
+                sym_info, self.kpoints, ksym_map, protmat_list,
+                wann_orbital_indices, self.basis_atom_map, has_soc=has_soc
+            )
+            d_band = compute_d_matrix_band(
+                sym_info, self.kpoints, ksym_map, protmat_list,
+                self.eigenvectors_list, self.S_k_list,
+                self.basis_atom_map, band_indices=band_indices, has_soc=has_soc
+            )
+
+            # Sanity checks
+            _verify_d_matrices(d_wann, d_band, ksym_map, verbose=verbose)
+
+            # Write .dmn file
+            dmn_file = f"{self.seedname}.dmn"
+            write_dmn_file(
+                dmn_file, ksym_map, d_wann, d_band,
+                num_bands=len(band_indices), num_wann=self.num_wann,
+                num_kpts=self.num_kpoints, verbose=verbose
+            )
+
         # Write parameter file (.win)
         if write_win:
             extra_kwargs = {}
@@ -953,6 +1077,7 @@ class Wannier90Engine:
                 use_bloch_phases=False,
                 num_iter=self._override_num_iter,
                 guiding_centres=getattr(self, '_guiding_centres', False),
+                site_symmetry=site_symmetry,
                 **extra_kwargs,
             )
             write_win_file(self.seedname, win_config, verbose=verbose)

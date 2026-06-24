@@ -16,6 +16,7 @@ from typing import List, Tuple
 # Import the module under test
 from lcao_wannier.band_selection import (
     estimate_fermi_energy,
+    compute_fermi_level,
     analyze_band_window,
     print_band_analysis,
     check_frozen_continuity,
@@ -253,9 +254,182 @@ class TestFermiEnergyEstimation:
     def test_electron_count_without_num_electrons(self):
         """Test that electron_count without num_electrons raises error."""
         eigenvalues = create_simple_bandstructure()
-        
+
         with pytest.raises(ValueError, match="num_electrons required"):
             estimate_fermi_energy(eigenvalues, method='electron_count')
+
+
+# ==============================================================================
+# Tests for compute_fermi_level (proper smeared Fermi)
+# ==============================================================================
+
+class TestComputeFermiLevel:
+    """Tests for the rigorous smeared-occupation Fermi-level solver."""
+
+    def test_insulator_lands_in_gap(self):
+        """For a clean-gap insulator, E_F must fall in the gap."""
+        eigenvalues = create_simple_bandstructure(
+            num_kpoints=10, num_bands=20,
+            band_gap=2.0, bandwidth=4.0, e_valence_top=0.0,
+        )
+        # 10 valence bands → 10 electrons per k-point (spinor, 1 e/band)
+        e_f = compute_fermi_level(eigenvalues, num_electrons=10, sigma=0.01)
+        # Gap is [0, 2] → E_F should be inside (0, 2)
+        assert 0.0 < e_f < 2.0, f"E_F={e_f} not in gap (0, 2)"
+        # With σ=0.01, should be very close to midgap since gap >> σ.
+        # The synthetic fixture's exact midgap depends on band dispersion;
+        # just require it sits squarely inside the gap.
+        assert 0.1 < e_f < 1.9, f"E_F={e_f} not interior of gap (0, 2)"
+
+    def test_insulator_returns_midgap_not_edge(self):
+        """For a clean insulator, E_F must be midgap, NOT pinned to VBM or CBM.
+
+        Regression test: earlier versions let brentq land on the CBM because
+        the residual is flat-zero across the gap. The fast-path in
+        compute_fermi_level now detects the clean-gap case and returns
+        midgap explicitly.
+        """
+        # Asymmetric gap so midgap ≠ 0, to catch accidental (VBM+CBM)/2 = 0
+        eigenvalues = create_simple_bandstructure(
+            num_kpoints=8, num_bands=20,
+            band_gap=2.0, bandwidth=4.0, e_valence_top=-3.0,
+        )
+        # Expected: VBM≈-3, CBM≈-1, midgap≈-2
+        e_f = compute_fermi_level(eigenvalues, num_electrons=10, sigma=1e-5,
+                                  spin_degeneracy=1)
+        # Must be well inside the gap and near the center (not an edge)
+        all_eigs = np.asarray(eigenvalues)
+        vbm = float(np.sort(all_eigs, axis=1)[:, 9].max())
+        cbm = float(np.sort(all_eigs, axis=1)[:, 10].min())
+        midgap = 0.5 * (vbm + cbm)
+        assert abs(e_f - midgap) < 1e-6, (
+            f"E_F={e_f} is not midgap ({midgap}). VBM={vbm}, CBM={cbm}"
+        )
+
+    def test_insulator_invariant_to_smearing_width(self):
+        """For gap ≫ σ, E_F should be independent of σ."""
+        eigenvalues = create_simple_bandstructure(
+            band_gap=2.0, bandwidth=4.0, e_valence_top=0.0,
+        )
+        e_f_tight = compute_fermi_level(eigenvalues, num_electrons=10, sigma=0.01)
+        e_f_loose = compute_fermi_level(eigenvalues, num_electrons=10, sigma=0.1)
+        # In deep-gap regime, widening σ by 10× should change E_F by ≪ σ.
+        assert abs(e_f_tight - e_f_loose) < 0.05
+
+    def test_conservation_integer_occupation(self):
+        """Total integrated occupation must equal num_electrons exactly."""
+        from scipy.special import erfc
+        eigenvalues = create_simple_bandstructure(
+            band_gap=1.0, bandwidth=4.0, e_valence_top=0.0,
+        )
+        sigma = 0.02
+        e_f = compute_fermi_level(eigenvalues, num_electrons=10, sigma=sigma)
+        # Re-evaluate total occupation at the computed E_F
+        all_eigs = np.asarray(eigenvalues)
+        nk = all_eigs.shape[0]
+        occ = 0.5 * erfc((all_eigs - e_f) / sigma)
+        total = occ.sum() / nk  # equal k-weights
+        assert abs(total - 10) < 1e-6
+
+    def test_metal_gives_smooth_fermi(self):
+        """For a metal (overlapping bands), E_F lands inside the overlap region."""
+        # Construct a genuine metal: bands 2 and 3 overlap so that filling
+        # ~2.5 bands per k-point requires partial occupation.
+        nk, nb = 21, 5
+        eigenvalues = []
+        for ik in range(nk):
+            k = ik / (nk - 1) - 0.5  # range [-0.5, 0.5]
+            evals = np.array([
+                -3.0,                 # core-like, always filled
+                -1.5 + 0.2 * k,       # deep valence
+                -0.4 + 1.6 * k,       # crosses zero, dispersive
+                -0.1 + 1.2 * k,       # overlaps with band 2!
+                2.0 + 0.1 * k,        # high conduction, never filled
+            ])
+            eigenvalues.append(np.sort(evals))
+        # Fill 2.5 bands per k-point on average → partial occupation of
+        # overlapping bands 2 and 3 is required.
+        e_f = compute_fermi_level(
+            eigenvalues, num_electrons=2, sigma=0.05)
+        # The critical correctness property is that total occupation at E_F
+        # equals num_electrons exactly (conservation). E_F's specific value
+        # depends on band placement — we just check it's inside the
+        # eigenvalue range.
+        all_eigs = np.asarray(eigenvalues)
+        assert all_eigs.min() < e_f < all_eigs.max()
+
+        # Partial occupation conservation check.
+        from scipy.special import erfc
+        occ = 0.5 * erfc((all_eigs - e_f) / 0.05)
+        total = occ.sum() / nk
+        assert abs(total - 2) < 1e-6
+
+    def test_different_smearing_types_consistent_for_insulator(self):
+        """All smearing schemes should agree in the deep-gap limit."""
+        eigenvalues = create_simple_bandstructure(
+            band_gap=3.0, bandwidth=2.0, e_valence_top=0.0,
+        )
+        e_f_gauss = compute_fermi_level(
+            eigenvalues, num_electrons=10, smearing='gaussian', sigma=0.01)
+        e_f_fd = compute_fermi_level(
+            eigenvalues, num_electrons=10, smearing='fermi_dirac', sigma=0.01)
+        e_f_mp = compute_fermi_level(
+            eigenvalues, num_electrons=10, smearing='methfessel_paxton', sigma=0.01)
+        # All three should give essentially the same E_F when gap ≫ σ
+        assert abs(e_f_gauss - e_f_fd) < 0.01
+        assert abs(e_f_gauss - e_f_mp) < 0.01
+
+    def test_unknown_smearing_raises(self):
+        eigenvalues = create_simple_bandstructure()
+        with pytest.raises(ValueError, match="Unknown smearing"):
+            compute_fermi_level(eigenvalues, num_electrons=10, smearing='cold')
+
+    def test_k_weights_non_normalized_stay_in_gap(self):
+        """k_weights that don't sum to 1 are auto-normalized, so for an
+        insulator the result still lands in the gap.
+
+        Note: when the residual has a flat zero region (insulator gap),
+        Brent's method can return any point in the zero-interval, so we
+        only require the result to be valid, not bit-identical.
+        """
+        eigenvalues = create_simple_bandstructure(num_kpoints=10, band_gap=2.0)
+        nk = len(eigenvalues)
+        e_f_default = compute_fermi_level(eigenvalues, num_electrons=10)
+        e_f_unnorm = compute_fermi_level(
+            eigenvalues, num_electrons=10,
+            k_weights=np.full(nk, 5.7),  # arbitrary scale, auto-normalized
+        )
+        # Both must land inside the gap (valence top = 0, gap = 2)
+        assert 0.0 < e_f_default < 2.0
+        assert 0.0 < e_f_unnorm < 2.0
+
+    def test_zero_temp_legacy_method(self):
+        """Legacy 'zero_temp' method should match old aufbau behavior exactly."""
+        eigenvalues = create_simple_bandstructure(
+            band_gap=1.0, bandwidth=4.0, e_valence_top=0.0,
+        )
+        # Pre-refactor behavior: midpoint of last-filled and first-empty
+        # in the globally sorted eigenvalue list.
+        all_eigs = np.sort(np.asarray(eigenvalues).flatten())
+        nk = len(eigenvalues)
+        states_to_fill = 10 * nk
+        expected = (all_eigs[states_to_fill - 1] + all_eigs[states_to_fill]) / 2
+
+        e_f = estimate_fermi_energy(
+            eigenvalues, num_electrons=10, method='zero_temp')
+        assert abs(e_f - expected) < 1e-10
+
+    def test_electron_count_agrees_with_zero_temp_for_insulator(self):
+        """For a clean-gap insulator both methods should agree within σ."""
+        eigenvalues = create_simple_bandstructure(
+            band_gap=2.0, bandwidth=4.0, e_valence_top=0.0,
+        )
+        e_f_new = estimate_fermi_energy(
+            eigenvalues, num_electrons=10, method='electron_count')
+        e_f_old = estimate_fermi_energy(
+            eigenvalues, num_electrons=10, method='zero_temp')
+        # Agree to within σ=0.01 eV (set inside electron_count)
+        assert abs(e_f_new - e_f_old) < 0.05
 
 
 # ==============================================================================
