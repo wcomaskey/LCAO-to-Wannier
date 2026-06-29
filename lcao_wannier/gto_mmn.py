@@ -16,7 +16,10 @@ scripts/analytic_mmn_dev.py):
   * Convention II Bloch phase e^{ik.g}; AOs centred at the nucleus.
   * printed coefficients used with UNNORMALIZED primitives e^{-a r^2}; the
     contracted AO is normalized to unit self-overlap.
-  * order of internal storage: S=s; P=x,y,z; D=2z^2-x^2-y^2,xz,yz,x^2-y^2,xy.
+  * order of internal storage (manual basisset p.27): S=s; P=x,y,z;
+    D=2z^2-x^2-y^2,xz,yz,x^2-y^2,xy; F=7, G=9 real solid harmonics (see _FCART,
+    _GCART). The Hermite/overlap engine is angular-momentum general; only the
+    real-solid-harmonic -> Cartesian tables are per-l.
 """
 import re
 import numpy as np
@@ -34,7 +37,34 @@ _DCART = [
 ]
 _PCART = [[((1, 0, 0), 1.0)], [((0, 1, 0), 1.0)], [((0, 0, 1), 1.0)]]
 _SCART = [[((0, 0, 0), 1.0)]]
-_LCART = {0: _SCART, 1: _PCART, 2: _DCART}
+# F real solid harmonics, CRYSTAL "order of internal storage" (manual basisset
+# p.27): (2z^2-3x^2-3y^2)z, (4z^2-x^2-y^2)x, (4z^2-x^2-y^2)y, (x^2-y^2)z, xyz,
+# (x^2-3y^2)x, (3x^2-y^2)y.
+_FCART = [
+    [((0, 0, 3), 2.0), ((2, 0, 1), -3.0), ((0, 2, 1), -3.0)],   # (2z^2-3x^2-3y^2)z
+    [((1, 0, 2), 4.0), ((3, 0, 0), -1.0), ((1, 2, 0), -1.0)],   # (4z^2-x^2-y^2)x
+    [((0, 1, 2), 4.0), ((2, 1, 0), -1.0), ((0, 3, 0), -1.0)],   # (4z^2-x^2-y^2)y
+    [((2, 0, 1), 1.0), ((0, 2, 1), -1.0)],                      # (x^2-y^2)z
+    [((1, 1, 1), 1.0)],                                         # xyz
+    [((3, 0, 0), 1.0), ((1, 2, 0), -3.0)],                      # (x^2-3y^2)x
+    [((2, 1, 0), 3.0), ((0, 3, 0), -1.0)],                      # (3x^2-y^2)y
+]
+# G real solid harmonics, same source (manual basisset p.27). G shells are
+# polarization-only in CRYSTAL but are included here for completeness.
+_GCART = [
+    [((4, 0, 0), 3.0), ((2, 2, 0), 6.0), ((2, 0, 2), -24.0),
+     ((0, 4, 0), 3.0), ((0, 2, 2), -24.0), ((0, 0, 4), 8.0)],   # 3x^4+6x^2y^2-24x^2z^2+3y^4-24y^2z^2+8z^4
+    [((1, 0, 3), 4.0), ((3, 0, 1), -3.0), ((1, 2, 1), -3.0)],   # (4z^2-3x^2-3y^2)xz
+    [((0, 1, 3), 4.0), ((2, 1, 1), -3.0), ((0, 3, 1), -3.0)],   # (4z^2-3x^2-3y^2)yz
+    [((2, 0, 2), 6.0), ((4, 0, 0), -1.0), ((0, 2, 2), -6.0),
+     ((0, 4, 0), 1.0)],                                         # (x^2-y^2)(6z^2-x^2-y^2)
+    [((1, 1, 2), 6.0), ((3, 1, 0), -1.0), ((1, 3, 0), -1.0)],   # (6z^2-x^2-y^2)xy
+    [((3, 0, 1), 1.0), ((1, 2, 1), -3.0)],                      # (x^2-3y^2)xz
+    [((2, 1, 1), 3.0), ((0, 3, 1), -1.0)],                      # (3x^2-y^2)yz
+    [((4, 0, 0), 1.0), ((2, 2, 0), -6.0), ((0, 4, 0), 1.0)],    # x^4-6x^2y^2+y^4
+    [((3, 1, 0), 1.0), ((1, 3, 0), -1.0)],                      # (x^2-y^2)xy
+]
+_LCART = {0: _SCART, 1: _PCART, 2: _DCART, 3: _FCART, 4: _GCART}
 
 
 # ----------------------------------------------------------------------------
