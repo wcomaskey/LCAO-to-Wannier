@@ -137,7 +137,7 @@ def parse_win_windows(path):
     """Parse num_wann/num_bands and dis_* window bounds from a .win file."""
     import re
     keys = ('num_wann', 'num_bands', 'dis_win_min', 'dis_win_max',
-            'dis_froz_min', 'dis_froz_max')
+            'dis_froz_min', 'dis_froz_max', 'fermi_energy')
     p = {}
     for line in open(path):
         m = re.match(r'\s*(\w+)\s*=\s*([-\d.eE+]+)', line)

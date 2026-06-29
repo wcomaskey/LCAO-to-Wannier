@@ -857,6 +857,8 @@ def write_mmn_file_lcao(
     recip_lattice: Optional[np.ndarray] = None,
     conditioning: Optional[str] = None,
     conditioning_knee: float = 0.5,
+    gto_aos: Optional[List[dict]] = None,
+    gto_cutoff: float = 16.0,
 ) -> None:
     """
     Write the .mmn file for LCAO methods.
@@ -916,6 +918,15 @@ def write_mmn_file_lcao(
         'lowdin_no_berry': Lowdin method WITHOUT Berry phase (for comparison).
             Requires S_k_list parameter. Produces plain inner products.
         'midpoint': Symmetric midpoint approximation with Berry phase.
+        'analytic': Exact analytic Gaussian-overlap MMN. Requires gto_aos
+            (parsed CRYSTAL GTO basis). No approximation — M is unitary on any
+            k-mesh. See lcao_wannier.gto_mmn.
+    gto_aos : list of dict, optional
+        Parsed GTO basis (from gto_mmn.parse_gto_basis). Required for
+        method='analytic'.
+    gto_cutoff : float, optional
+        AO-pair centre-distance cutoff in Bohr for the analytic method
+        (default: 16.0). Pairs farther apart are skipped (negligible overlap).
     S_k_list : list of ndarray, optional
         Full overlap matrices S(k) for each k-point (required for Lowdin).
     band_indices : ndarray, optional
@@ -944,8 +955,50 @@ def write_mmn_file_lcao(
 
     use_lowdin = (method in ('lowdin', 'lowdin_no_berry') and S_k_list is not None)
     use_berry_phase = (method == 'lowdin')  # no berry for 'lowdin_no_berry'
+    use_analytic = (method == 'analytic')
 
-    if use_lowdin:
+    if use_analytic:
+        if gto_aos is None:
+            raise ValueError(
+                "method='analytic' requires gto_aos (parsed GTO basis). "
+                "Thread it through via engine.gto_aos / write_files."
+            )
+        from . import gto_mmn as _gto
+        method_name = "Analytic GTO"
+        n_ao = len(gto_aos)
+        n_orb = eigenvectors_list[0].shape[0]
+        if n_ao != n_orb:
+            raise ValueError(
+                f"Analytic MMN: GTO basis has {n_ao} AOs but eigenvectors have "
+                f"{n_orb} orbitals. (SOC/spinor bases are not yet supported.)"
+            )
+        # Lattice in Bohr. The CRYSTAL parser always returns lattice_vectors in
+        # Angstrom, and the Gaussian exponents are in atomic units, so convert
+        # unconditionally (the AO centres from parse_gto_basis are already Bohr).
+        lattice_bohr = np.asarray(lattice_vectors, dtype=float) * _gto.ANG2BOHR
+        recip_bohr = _gto.reciprocal_bohr(lattice_bohr)
+        cells_R = [(g, np.asarray(g, dtype=float) @ lattice_bohr)
+                   for g in real_space_matrices]
+        # Precompute S^{(b)}(g) ONCE per UNIQUE b-vector across the whole mesh.
+        Sb_by_b = {}          # b_key -> {g: S^{(b)}(g)}
+        bkey_of = {}          # (k_idx, neighbor_idx) -> b_key
+        for k_idx in range(num_kpoints):
+            for ni, neighbor in enumerate(neighbor_list[k_idx]):
+                G_shift = np.asarray(neighbor['G_shift'], dtype=float)
+                b_frac = kpoints[neighbor['id']] + G_shift - kpoints[k_idx]
+                b_cart = b_frac @ recip_bohr
+                key = tuple(np.round(b_cart, 6))
+                bkey_of[(k_idx, ni)] = key
+                if key not in Sb_by_b:
+                    Sb_by_b[key] = _gto.build_Sb_cells(
+                        gto_aos, b_cart, cells_R, cutoff=gto_cutoff)
+        if verbose:
+            print(f"  Analytic GTO: precomputed S^(b)(g) for "
+                  f"{len(Sb_by_b)} unique b-vector(s)")
+        # Band-selected eigenvectors (full AO rows, selected band columns).
+        C_sel = [C[:, band_indices] if band_indices is not None else C
+                 for C in eigenvectors_list]
+    elif use_lowdin:
         method_name = "Lowdin" + ("" if use_berry_phase else " (no Berry phase)")
         # Precompute Lowdin-transformed eigenvectors
         if verbose:
@@ -975,11 +1028,19 @@ def write_mmn_file_lcao(
 
         # Process each k-point
         for k_idx in range(num_kpoints):
-            for neighbor in neighbor_list[k_idx]:
+            for ni, neighbor in enumerate(neighbor_list[k_idx]):
                 k_next_idx = neighbor['id']
                 G_shift = neighbor['G_shift']
 
-                if use_lowdin:
+                if use_analytic:
+                    # Exact analytic overlap:
+                    #   M = C(k)^dag . Stilde^{(b)}(k+b) . C(k+b)
+                    # (k+b)_frac = kpoints[k_next] + G_shift; integer G_shift
+                    # contributes only trivial phases (e^{i2pi G.g}=1).
+                    kpb_frac = kpoints[k_next_idx] + np.asarray(G_shift, dtype=float)
+                    Stilde = _gto.Sb_at_kpb(Sb_by_b[bkey_of[(k_idx, ni)]], kpb_frac)
+                    M_kb = C_sel[k_idx].conj().T @ Stilde @ C_sel[k_next_idx]
+                elif use_lowdin:
                     # Lowdin method:
                     # With Berry: M = C_tilde^dag(k) . diag(exp(-i b.tau)) . C_tilde(k+b)
                     # Without:    M = C_tilde^dag(k) . C_tilde(k+b)

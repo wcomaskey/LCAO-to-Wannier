@@ -105,7 +105,16 @@ def main():
     w = read_w90_band_outputs(args.seedname)        # canonical Wannier bands
     p = parse_win_windows(args.seedname + '.win')   # windows (rel E_F)
     rsm, params = build_real_space(args.input, args.spin)
-    e_fermi = params.fermi_energy if params.fermi_energy is not None else 0.0
+
+    # CRITICAL: the .eig (hence the Wannier band.dat) was written relative to the
+    # E_F the engine actually used, which is recorded in the .win as fermi_energy.
+    # That can DIFFER from CRYSTAL's printed Fermi (params.fermi_energy) when the
+    # engine auto-detects E_F from band filling. Use the .win value so the DFT and
+    # Wannier bands share the SAME zero; otherwise a constant offset inflates the
+    # RMS (e.g. BN: 3.3 eV offset -> phantom 1900 meV instead of the true ~0.5).
+    e_fermi = p.get('fermi_energy')
+    if e_fermi is None:
+        e_fermi = params.fermi_energy if params.fermi_energy is not None else 0.0
 
     wann_rel = w['eigenvalues']                     # already rel E_F (eig frame)
     dft_rel = dft_bands_at(w['kpoints_frac'], rsm) - e_fermi

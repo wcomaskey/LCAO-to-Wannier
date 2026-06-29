@@ -244,12 +244,17 @@ def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
     has_soc = getattr(params, 'has_soc', False) or getattr(engine, 'has_soc', False)
     spin_deg = 1 if has_soc else 2
     try:
-        estimated = estimate_fermi_energy(
-            engine.eigenvalues_list,
-            num_electrons=params.num_electrons,
-            method='electron_count',
-            spin_degeneracy=spin_deg,
-        )
+        # CRYSTAL reports the Fermi energy at the VBM (top of the highest
+        # occupied band) for insulators, NOT at mid-gap. Compare against the VBM
+        # from band filling, so a genuine frame mismatch (SPINLOCK/level shifter,
+        # off by the shift amount) is still caught, WITHOUT falsely flagging the
+        # legitimate gap/2 offset that separates the VBM from mid-gap in every
+        # insulator (e.g. h-BN: 6.6 eV gap -> 3.3 eV VBM-vs-midgap difference).
+        eigs = np.asarray(engine.eigenvalues_list, dtype=float)  # (nk, nbands)
+        n_occ = int(round(params.num_electrons / spin_deg))
+        if n_occ < 1 or n_occ > eigs.shape[1]:
+            return
+        estimated = float(eigs[:, n_occ - 1].max())  # VBM (HOMO across the BZ)
     except Exception as exc:
         print(f"  ⚠ Could not run Fermi sanity check: {exc}")
         return
@@ -268,7 +273,7 @@ def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
     print(f"  ⚠  FERMI ENERGY FRAME MISMATCH DETECTED{stage_tag}")
     print("!" * 78)
     print(f"  Parsed from CRYSTAL output : {params.fermi_energy:+.4f} eV")
-    print(f"  Estimated from band filling: {estimated:+.4f} eV "
+    print(f"  VBM from band filling      : {estimated:+.4f} eV "
           f"(N_electrons={params.num_electrons})")
     print(f"  Discrepancy                : {discrepancy:.4f} eV "
           f"(tolerance {FERMI_FRAME_TOLERANCE_EV} eV)")
@@ -281,7 +286,7 @@ def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
     print("       removed before the Fermi-energy header was written")
     print("    - Two-component SOC SCF with an internal Fermi-bias field")
     print()
-    print(f"  → Falling back to the electron-count estimate "
+    print(f"  → Falling back to the VBM from band filling "
           f"({estimated:+.4f} eV).")
     print(f"  → To override this, re-run with: "
           f"--fermi-energy <your_value_in_eV>")
@@ -513,6 +518,81 @@ def _apply_spread_window_assist_legacy(engine, args):
     engine._dis_win = res.dis_win
 
 
+def _insulator_frozen_max(
+    eigenvalues, projectability, selected_indices, e_fermi, num_wann,
+    num_electrons, has_soc, cur_froz_max_abs, cond_p_min=0.70, margin=0.3,
+    verbose=True,
+):
+    """For an insulator, return a raised dis_froz_max (absolute eV) that also
+    FREEZES the well-represented low conduction bands, or None to leave it as is.
+
+    A valence-only frozen window gives an exact valence band model but leaves the
+    conduction bands to disentanglement over the (necessarily wide) outer window,
+    which reproduces them poorly. The low conduction bands right above the gap are
+    the antibonding partners of the target orbitals, so they project well and CAN
+    be frozen — but higher conduction bands acquire nearly-free-electron / diffuse
+    character that the atom-centred target basis cannot represent (low
+    projectability); freezing those would force an unrepresentable subspace and
+    wreck localization. So we freeze the contiguous low conduction bands whose
+    projectability stays >= cond_p_min, and stop where it drops:
+
+        dis_froz_max = max_k(top of the last well-projected conduction band) + margin
+
+    capped so the per-k frozen count never exceeds num_wann (the wannier90
+    disentanglement requirement). Conduction bands overlap across the BZ, so there
+    is no clean global gap to land in — the per-k count is the real constraint.
+
+    Parameters
+    ----------
+    eigenvalues   : (nk, nbands) absolute eV (full solved set, incl. core).
+    projectability: (nk, nbands) per-band projectability onto the target orbitals.
+    selected_indices : indices of the bands written to the .eig.
+    cur_froz_max_abs : current (valence-only) dis_froz_max, absolute eV.
+    cond_p_min    : minimum projectability for a conduction band to be frozen.
+    """
+    if num_electrons is None or cur_froz_max_abs is None:
+        return None
+    spin_deg = 1 if has_soc else 2
+    nb = eigenvalues.shape[1]
+    n_occ = int(round(num_electrons / spin_deg))
+    if n_occ < 1 or n_occ >= nb:
+        return None
+    # Insulator check: clean gap between highest occupied and lowest empty band.
+    vbm = float(eigenvalues[:, n_occ - 1].max())
+    cbm = float(eigenvalues[:, n_occ].min())
+    if cbm - vbm < 0.2:                      # metal / semimetal — leave as is
+        return None
+
+    sel = np.asarray(selected_indices, dtype=int)
+    if sel.size <= num_wann:                 # no disentanglement freedom anyway
+        return None
+    # Per-k count ceiling: highest cutoff keeping <= num_wann selected bands/k.
+    sel_sorted = np.sort(eigenvalues[:, sel], axis=1)
+    cap = float(np.min(sel_sorted[:, num_wann]))   # global min of (num_wann+1)-th
+
+    avg_p = projectability.mean(axis=0)
+    bot = eigenvalues.min(axis=0)
+    top = eigenvalues.max(axis=0)
+    # Conduction bands among the selected set, ordered by their lower edge.
+    cond = sorted((b for b in sel if bot[b] > cbm - 0.5), key=lambda b: bot[b])
+    froz_top = None
+    for b in cond:
+        if avg_p[b] < cond_p_min:            # NFE / diffuse — stop here
+            break
+        cand = top[b] + margin
+        if cand - margin >= cap:             # would exceed num_wann frozen/k
+            break
+        froz_top = min(cand, cap - 0.05)
+    if froz_top is None or froz_top <= cur_froz_max_abs + 0.1:
+        return None
+    if verbose:
+        print(f"    [insulator] gap = {cbm - vbm:.2f} eV at E_F; raising "
+              f"dis_froz_max {cur_froz_max_abs - e_fermi:+.2f} -> "
+              f"{froz_top - e_fermi:+.2f} eV (rel E_F) to freeze the "
+              f"well-projected low conduction (P >= {cond_p_min:.2f})")
+    return froz_top
+
+
 def _apply_method_pdwf(engine, args, has_soc, lines):
     """Apply LCAO-PDWF method: chemistry-grounded projectability band selection."""
     print("\nLCAO-PDWF band selection...")
@@ -707,6 +787,22 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
                             windows.dis_froz_max - e_fermi)
     else:
         engine._dis_froz = None
+
+    # For insulators, raise the frozen-window top through the gap so the low
+    # conduction manifold is FROZEN too (a valence-only window leaves conduction
+    # to disentanglement, which reproduces it poorly). Opt out: --frozen-conduction off.
+    if (getattr(args, 'frozen_conduction', 'auto') != 'off'
+            and engine._dis_froz is not None and windows.dis_froz_min is not None):
+        new_froz_max_abs = _insulator_frozen_max(
+            eigenvalues, np.asarray(proj), all_active, e_fermi, num_wann,
+            getattr(params_calc, 'num_electrons', None), has_soc,
+            windows.dis_froz_max,
+            cond_p_min=getattr(args, 'conduction_pmin', 0.70),
+        )
+        if new_froz_max_abs is not None:
+            windows.dis_froz_max = new_froz_max_abs
+            engine._dis_froz = (windows.dis_froz_min - e_fermi,
+                                new_froz_max_abs - e_fermi)
 
     engine._num_bands_for_win = len(all_active)
 
@@ -1939,6 +2035,19 @@ def stage2_create_data_files(args):
         print(f"⚠ Warning: Could not parse atomic basis info: {e}")
         print("  MMN file will not have phase correction (may cause negative spreads!)")
 
+    # Parse the GTO basis for the exact analytic MMN method, if requested
+    if getattr(args, 'mmn_method', 'midpoint') == 'analytic':
+        print("\nParsing GTO basis for analytic MMN...")
+        try:
+            from lcao_wannier.gto_mmn import parse_gto_basis
+            engine.gto_aos = parse_gto_basis(lines)
+            print(f"✓ Parsed {len(engine.gto_aos)} contracted AOs "
+                  f"(exact analytic MMN enabled)")
+        except Exception as e:
+            print(f"⚠ Warning: Could not parse GTO basis: {e}")
+            print("  Falling back to midpoint MMN method.")
+            args.mmn_method = 'midpoint'
+
     # Set up site_symmetry attributes if requested
     if getattr(args, 'site_symmetry', False):
         try:
@@ -2820,13 +2929,35 @@ EXAMPLES:
                              '--proj-threshold). Raise it to exclude more bands '
                              'and tighten localization.')
     parser.add_argument('--mmn-method', type=str, default='midpoint',
-                        choices=['midpoint', 'lowdin', 'lowdin_no_berry'],
+                        choices=['midpoint', 'lowdin', 'lowdin_no_berry',
+                                 'analytic'],
                         help="Algorithm for the .mmn overlaps. 'midpoint' "
                              "(default): S evaluated at k+b/2 (accurate on dense "
                              "grids, non-unitary on coarse ones). 'lowdin': "
                              "Lowdin-orthonormalized overlaps with explicit Berry "
                              "phase (singular values bounded [0,1]). "
-                             "'lowdin_no_berry': same without the explicit phase.")
+                             "'lowdin_no_berry': same without the explicit phase. "
+                             "'analytic': exact analytic Gaussian-overlap MMN "
+                             "(unitary on any k-mesh; parses the CRYSTAL GTO "
+                             "basis from the .out).")
+    parser.add_argument('--frozen-conduction', type=str, default='auto',
+                        choices=['auto', 'off'],
+                        help="For insulators (PDWF method), whether to extend the "
+                             "frozen window through the gap to pin the low "
+                             "conduction manifold. 'auto' (default): freeze the "
+                             "well-projected low conduction bands (projectability "
+                             ">= --conduction-pmin), capped so the per-k frozen "
+                             "count stays <= num_wann, so both valence and low "
+                             "conduction are reproduced. 'off': valence-only "
+                             "frozen window (exact valence, loose conduction).")
+    parser.add_argument('--conduction-pmin', type=float, default=0.70,
+                        help="Minimum projectability for a conduction band to be "
+                             "frozen by --frozen-conduction auto (default: 0.70). "
+                             "LOWER it (e.g. 0.5) to freeze MORE conduction bands "
+                             "above E_F; RAISE it to freeze fewer. Bands below the "
+                             "threshold have nearly-free-electron/diffuse character "
+                             "the atom-centred basis cannot represent, so freezing "
+                             "them degrades localization.")
     parser.add_argument('--window-mode', type=str, default='manifold',
                         choices=['manifold', 'spread'],
                         help="How --spread-window-assist positions the windows. "

@@ -974,6 +974,8 @@ class Wannier90Engine:
                 S_k_list=self.S_k_list,
                 band_indices=band_indices,
                 recip_lattice=self.recip_lattice,
+                gto_aos=getattr(self, 'gto_aos', None),
+                gto_cutoff=getattr(self, 'gto_cutoff', 16.0),
             )
         else:
             # Fallback to standard MMN writer (no phase correction)

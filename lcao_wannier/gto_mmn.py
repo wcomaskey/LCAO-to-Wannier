@@ -96,48 +96,71 @@ def parse_gto_basis(lines):
 # Gaussian integrals
 # ----------------------------------------------------------------------------
 def _herm_1d(p, PA, PB, la, lb):
-    """1-D overlap polynomial via Hermite recursion; PA/PB may be complex."""
-    S = np.zeros((la + 2, lb + 2), dtype=complex)
-    S[0, 0] = 1.0
+    """1-D overlap polynomial via Hermite recursion; PA/PB may be complex.
+
+    p, PA, PB may be scalars or broadcastable arrays (e.g. one entry per
+    primitive pair); the recursion is elementwise and returns S[la, lb] with the
+    same shape as the broadcast of the inputs."""
+    p = np.asarray(p, dtype=complex)
+    PA = np.asarray(PA, dtype=complex)
+    PB = np.asarray(PB, dtype=complex)
+    shp = np.broadcast_shapes(p.shape, PA.shape, PB.shape)
+    half = 0.5 / p
+    S = np.zeros((la + 2, lb + 2) + shp, dtype=complex)
+    S[0, 0] = np.ones(shp, dtype=complex)
     for i in range(la + 1):
         for j in range(lb + 1):
             if i == 0 and j == 0:
                 continue
             if i > 0:
-                S[i, j] = PA * S[i - 1, j] + (0.5 / p) * (
+                S[i, j] = PA * S[i - 1, j] + half * (
                     (i - 1) * S[i - 2, j] + j * S[i - 1, j - 1])
             else:
-                S[i, j] = PB * S[i, j - 1] + (0.5 / p) * (
+                S[i, j] = PB * S[i, j - 1] + half * (
                     i * S[i - 1, j - 1] + (j - 1) * S[i, j - 2])
     return S[la, lb]
 
 
 def _prim_mom(a, A, lA, b, B, lB, bvec):
-    """<g_a(r-A)| e^{-i bvec.r} | g_b(r-B)>, analytic (complex)."""
+    """<g_a(r-A)| e^{-i bvec.r} | g_b(r-B)>, analytic (complex).
+
+    a, b may be scalars or broadcastable arrays of exponents (one element per
+    primitive pair); the return has the broadcast shape."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
     p = a + b
-    P = (a * A + b * B) / p
-    Pp = P - 0.5j * bvec / p
-    pre = (np.exp(-a * b / p * np.dot(A - B, A - B)) * (pi / p) ** 1.5
-           * np.exp(-1j * np.dot(bvec, P)) * np.exp(-np.dot(bvec, bvec) / (4 * p)))
-    return pre * (_herm_1d(p, Pp[0] - A[0], Pp[0] - B[0], lA[0], lB[0])
-                  * _herm_1d(p, Pp[1] - A[1], Pp[1] - B[1], lA[1], lB[1])
-                  * _herm_1d(p, Pp[2] - A[2], Pp[2] - B[2], lA[2], lB[2]))
+    AB = A - B
+    P = [(a * A[d] + b * B[d]) / p for d in range(3)]
+    bdotP = bvec[0] * P[0] + bvec[1] * P[1] + bvec[2] * P[2]
+    res = ((pi / p) ** 1.5
+           * np.exp(-a * b / p * np.dot(AB, AB))
+           * np.exp(-np.dot(bvec, bvec) / (4 * p))
+           * np.exp(-1j * bdotP)).astype(complex)
+    for d in range(3):
+        Ppd = P[d] - 0.5j * bvec[d] / p
+        res = res * _herm_1d(p, Ppd - A[d], Ppd - B[d], lA[d], lB[d])
+    return res
 
 
 def _pair_overlap(ao_i, ao_j, Rj, bvec=None):
-    """<ao_i(0)| e^{-i bvec.r} | ao_j(+Rj)>. bvec=None -> plain overlap."""
+    """<ao_i(0)| e^{-i bvec.r} | ao_j(+Rj)>. bvec=None -> plain overlap.
+
+    Vectorized over the primitive-pair grid: the inner double loop over
+    primitives is replaced by a single broadcast call to _prim_mom."""
     if bvec is None:
         bvec = np.zeros(3)
     Ci = ao_i['center']
     Cj = ao_j['center'] + Rj
+    ea = np.array([pr[0] for pr in ao_i['prims']])[:, None]   # (na, 1)
+    ca = np.array([pr[1] for pr in ao_i['prims']])[:, None]
+    eb = np.array([pr[0] for pr in ao_j['prims']])[None, :]   # (1, nb)
+    cb = np.array([pr[1] for pr in ao_j['prims']])[None, :]
+    cab = ca * cb                                              # (na, nb)
     tot = 0.0 + 0.0j
     for (li, ci) in ao_i['terms']:
         for (lj, cj) in ao_j['terms']:
-            s = 0.0 + 0.0j
-            for (ea, ca) in ao_i['prims']:
-                for (eb, cb) in ao_j['prims']:
-                    s += ca * cb * _prim_mom(ea, Ci, li, eb, Cj, lj, bvec)
-            tot += ci * cj * s
+            block = _prim_mom(ea, Ci, li, eb, Cj, lj, bvec)   # (na, nb)
+            tot += ci * cj * np.sum(cab * block)
     return tot * ao_i['norm'] * ao_j['norm']
 
 
