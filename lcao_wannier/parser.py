@@ -769,6 +769,187 @@ def parse_overlap_and_fock_matrices(lines: List[str]) -> Tuple[List[Dict], Optio
     return matrices, direct_lattice_vectors
 
 
+def parse_overlap_and_fock_matrices_streaming(
+    filepath: str,
+    promote_complex: bool = True,
+) -> Tuple[Dict, Dict, Optional[List[List[float]]], List[str]]:
+    """
+    Streaming, low-memory equivalent of ``parse_overlap_and_fock_matrices``
+    *plus* the H_R_dict/S_R_dict organizing step.
+
+    Reads the CRYSTAL output line by line, building the per-R-vector matrices
+    directly. It never holds the whole file (no ``f.readlines()``) and never
+    builds the intermediate list of every parsed block, so peak memory is the
+    R-space matrices alone — not file_buffer + list + dicts simultaneously.
+
+    The control flow mirrors ``parse_overlap_and_fock_matrices`` exactly (same
+    regexes, same lower-triangular reconstruction, same (spin, R) Fock
+    combination order), so the returned dicts are identical to feeding that
+    function's output through the main script's organizing loop.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the CRYSTAL/LCAO output file.
+    promote_complex : bool or 'auto'
+        If True (default, matches legacy behaviour), real-only Fock blocks are
+        promoted to complex128. If False, real-only blocks are kept float64
+        (Design C: halves R-space memory for non-SOC systems). If 'auto', the
+        choice is made from SOC detection in the header (TWO-COMPONENT SCF):
+        complex for SOC, float64 for non-SOC. Blocks with a genuine imaginary
+        part are always complex regardless.
+
+    Returns
+    -------
+    H_R_dict : dict
+        Maps R-tuple -> {spin_channel: matrix} (complex128, or float64 when
+        ``promote_complex`` is False and there is no imaginary part).
+    S_R_dict : dict
+        Maps R-tuple -> overlap matrix (float64).
+    direct_lattice_vectors : list of list of float or None
+    header_lines : list of str
+        All lines preceding the first matrix block (with newlines), suitable
+        for ``parse_calculation_parameters`` / ``parse_atomic_basis_info`` /
+        ``parse_orbital_types`` without re-reading the file.
+    """
+    H_R_dict: Dict = {}
+    S_R_dict: Dict = {}
+    direct_lattice_vectors = None
+    fock_temp_storage: Dict = {}
+    header_lines: List[str] = []
+    seen_first_matrix = False
+
+    # In-progress matrix-collection state
+    collecting = False
+    col_indices: List[int] = []
+    data_lines: List[Tuple[int, List[int], List[float]]] = []
+    target = None  # ('overlap', R) or ('fock', spin, R, part)
+
+    current_spin_channel = None
+    capture_vectors = 0
+    pending_vectors: List[List[float]] = []
+
+    def finalize_matrix():
+        """Build the accumulated lower-triangular block and store it."""
+        nonlocal collecting, col_indices, data_lines, target
+        if target is not None and data_lines:
+            max_index = max(row for row, _, _ in data_lines)
+            n = max_index + 1
+            matrix = np.zeros((n, n), dtype=np.float64)
+            for row, cols, values in data_lines:
+                for col, val in zip(cols, values):
+                    matrix[row, col] = val
+            kind = target[0]
+            if kind == 'overlap':
+                S_R_dict[target[1]] = matrix
+            else:  # ('fock', spin, R, part)
+                _, spin, R, part = target
+                fock_temp_storage.setdefault((spin, R), {})[part] = matrix
+        collecting = False
+        col_indices = []
+        data_lines = []
+        target = None
+
+    with open(filepath, 'r') as f:
+        for raw in f:
+            line = raw.rstrip('\n')
+
+            # Capture the 3 lattice-vector lines following a DIRECT LATTICE header
+            if capture_vectors > 0:
+                vm = vector_line_pattern.match(line.strip())
+                if vm:
+                    comps = [float(v.replace('D', 'E').replace('d', 'e'))
+                             for v in float_pattern.findall(line.strip())]
+                    pending_vectors.append(comps)
+                capture_vectors -= 1
+                if capture_vectors == 0 and len(pending_vectors) == 3:
+                    direct_lattice_vectors = pending_vectors
+                continue
+
+            m_overlap = overlap_header_pattern.match(line)
+            m_fock = fock_header_pattern.match(line)
+            m_fock_simple = fock_simple_header_pattern.match(line)
+            m_spin = spin_channel_pattern.match(line)
+            m_spin_simple = spin_simple_pattern.match(line)
+            m_direct = direct_lattice_header_pattern.match(line)
+
+            is_header = (m_overlap or m_fock or m_fock_simple or m_spin
+                         or m_spin_simple or m_direct)
+
+            if is_header:
+                # Any header terminates the matrix currently being read.
+                finalize_matrix()
+
+                if not seen_first_matrix and (m_overlap or m_fock or m_fock_simple):
+                    seen_first_matrix = True
+
+                if m_direct:
+                    pending_vectors = []
+                    capture_vectors = 3
+                elif m_spin:
+                    current_spin_channel = m_spin.group(1).upper()
+                elif m_spin_simple:
+                    label = m_spin_simple.group(1).upper()
+                    current_spin_channel = ('ALPHA_ALPHA' if label == 'ALPHA'
+                                            else 'BETA_BETA')
+                elif m_overlap:
+                    R = tuple(int(m_overlap.group(j)) for j in range(1, 4))
+                    target = ('overlap', R)
+                    collecting = True
+                elif m_fock:
+                    part = m_fock.group(1).lower()
+                    R = tuple(int(m_fock.group(j)) for j in range(2, 5))
+                    target = ('fock', current_spin_channel, R, part)
+                    collecting = True
+                elif m_fock_simple:
+                    R = tuple(int(m_fock_simple.group(j)) for j in range(1, 4))
+                    target = ('fock', current_spin_channel, R, 'real')
+                    collecting = True
+                continue
+
+            # Non-header line
+            if not seen_first_matrix:
+                header_lines.append(raw)
+
+            if collecting:
+                stripped = line.strip()
+                if stripped == '':
+                    continue
+                if column_indices_pattern.match(line):
+                    col_indices = [int(num) - 1 for num in stripped.split()]
+                else:
+                    dm = data_line_pattern.match(line)
+                    if dm:
+                        row_index = int(dm.group(1)) - 1
+                        values = [float(v.replace('D', 'E').replace('d', 'e'))
+                                  for v in float_pattern.findall(dm.group(2))]
+                        data_lines.append((row_index, col_indices.copy(), values))
+
+        # Flush the final block at EOF
+        finalize_matrix()
+
+    # Resolve 'auto': float64 for non-SOC, complex128 for SOC.
+    if promote_complex == 'auto':
+        has_soc = any('TWO-COMPONENT' in l and 'SCF' in l for l in header_lines)
+        promote_complex = bool(has_soc)
+
+    # Combine Fock real/imag parts (same order/semantics as the legacy parser)
+    for (spin_channel, R), parts in fock_temp_storage.items():
+        real_part = parts.get('real')
+        imag_part = parts.get('imag')
+        if real_part is not None and imag_part is not None:
+            combined = real_part + 1j * imag_part
+        elif real_part is not None:
+            combined = real_part if not promote_complex else real_part.astype(np.complex128)
+        elif imag_part is not None:
+            combined = 1j * imag_part
+        else:
+            continue
+        H_R_dict.setdefault(R, {})[spin_channel] = combined
+
+    return H_R_dict, S_R_dict, direct_lattice_vectors, header_lines
+
+
 # ==============================
 # Spin Block Matrix Creation
 # ==============================
@@ -890,11 +1071,27 @@ def create_spin_block_matrices(
     return H_full_list, S_full_list
 
 
+def _select_spin_matrix(H_mats, spin_channel):
+    """Pick one spin channel's Fock matrix from H_R_dict[R].
+
+    H_mats is either a bare matrix or a {spin_channel: matrix} dict. When
+    spin_channel is given (e.g. 'ALPHA_ALPHA' / 'BETA_BETA') and present, that
+    channel is returned; otherwise the first channel is used (legacy behaviour,
+    correct for restricted single-channel systems).
+    """
+    if not isinstance(H_mats, dict):
+        return H_mats
+    if spin_channel is not None and spin_channel in H_mats:
+        return H_mats[spin_channel]
+    return list(H_mats.values())[0]
+
+
 def create_nonsoc_full_matrices(
     H_R_dict: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
     S_R_dict: Dict[Tuple[int, int, int], np.ndarray],
     direct_lattice_vectors: List[List[float]],
-    PRINTOUT: bool = False
+    PRINTOUT: bool = False,
+    spin_channel: Optional[str] = None,
 ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[Tuple[np.ndarray, np.ndarray]]]:
     """
     Construct full N x N Hamiltonian and overlap matrices for non-SOC systems.
@@ -969,7 +1166,7 @@ def create_nonsoc_full_matrices(
         if R in H_R_dict:
             # Get the raw lower-triangular Fock matrix for R
             H_mats_R = H_R_dict[R]
-            H_raw_R = list(H_mats_R.values())[0] if isinstance(H_mats_R, dict) else H_mats_R
+            H_raw_R = _select_spin_matrix(H_mats_R, spin_channel)
             H_raw_R = np.tril(H_raw_R)  # Enforce lower triangle
 
             if is_origin:
@@ -979,7 +1176,7 @@ def create_nonsoc_full_matrices(
             else:
                 if minus_R in H_R_dict:
                     H_mats_mR = H_R_dict[minus_R]
-                    H_raw_mR = list(H_mats_mR.values())[0] if isinstance(H_mats_mR, dict) else H_mats_mR
+                    H_raw_mR = _select_spin_matrix(H_mats_mR, spin_channel)
                     H_raw_mR = np.tril(H_raw_mR)
 
                     # H(R) = Lower(R) + StrictLower(-R)^T

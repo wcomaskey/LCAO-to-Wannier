@@ -12,6 +12,62 @@ from typing import Dict, List, Tuple, Optional
 # Data Preparation & Conversion
 # ==============================
 
+
+def prune_zero_rvectors(
+    real_space_matrices: Dict[Tuple[int, int, int], Dict[str, np.ndarray]],
+    threshold: float = 0.0,
+    verbose: bool = True,
+) -> Tuple[Dict[Tuple[int, int, int], Dict[str, np.ndarray]], int]:
+    """Drop R-vectors whose H(R) and S(R) are both negligible.
+
+    CRYSTAL emits real-space H(R)/S(R) for a generous number of cells (set by
+    the requested radial shells), so the far cells come back all-zero. Since
+    H(k) = sum_R e^{i k.R} H(R) (and likewise S(k)), an all-zero cell adds
+    nothing at any k. Removing it is therefore exact for ``threshold == 0`` and
+    shrinks every R-indexed structure downstream — most importantly the
+    engine's stacked H/S arrays, which persist through Stage 2.
+
+    The origin cell (0,0,0) is never pruned (it always carries on-site terms).
+    After (R,-R) symmetrization zero cells occur as both-zero pairs, so pruning
+    preserves Hermiticity of H(k).
+
+    Parameters
+    ----------
+    real_space_matrices : dict
+        Maps R-tuple -> {'H': matrix, 'S': matrix}.
+    threshold : float
+        A cell is pruned if max|H(R)| <= threshold and max|S(R)| <= threshold.
+        0.0 (default) prunes only exactly-zero cells (bit-identical results).
+        A small positive value (e.g. 1e-10) also drops numerically negligible
+        cells — faster/smaller but no longer guaranteed bit-identical.
+    verbose : bool
+        Print a one-line summary.
+
+    Returns
+    -------
+    (pruned_matrices, num_pruned)
+    """
+    kept = {}
+    pruned = 0
+    for R, mats in real_space_matrices.items():
+        if R == (0, 0, 0):
+            kept[R] = mats
+            continue
+        H = mats.get('H')
+        S = mats.get('S')
+        h_max = float(np.abs(H).max()) if H is not None and H.size else 0.0
+        s_max = float(np.abs(S).max()) if S is not None and S.size else 0.0
+        if h_max <= threshold and s_max <= threshold:
+            pruned += 1
+            continue
+        kept[R] = mats
+    if verbose and pruned:
+        total = pruned + len(kept)
+        mode = "exact-zero" if threshold == 0.0 else f"|.|<={threshold:g}"
+        print(f"  Pruned {pruned} zero R-vectors ({mode}): "
+              f"{total} -> {len(kept)}")
+    return kept, pruned
+
 def prepare_real_space_matrices(
     H_full_list: List[Tuple[np.ndarray, np.ndarray]],
     S_full_list: List[Tuple[np.ndarray, np.ndarray]],

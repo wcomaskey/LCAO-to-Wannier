@@ -50,6 +50,54 @@ class SmartSelectionResult:
     recommended_dis_froz: Optional[Tuple[float, float]] = None  # frozen window (rel E_F)
 
 
+def _clamp_frozen_window_kresolved(eig_sel_rel, num_wann, froz):
+    """Shrink a frozen window so the per-k count rule holds across the BZ sample.
+
+    Wannier90 requires that at EVERY k-point at most num_wann of the selected
+    bands lie inside the frozen (inner) window. A window sized to the frontier
+    bands' energy span still traps interloper bands that disperse into that range
+    at some k-points (e.g. steep bands at the zone center), so the naive window
+    can hold far more than num_wann bands at a single k.
+
+    This trims whichever edge most reduces the worst-case per-k count (preserving
+    the Fermi-level region) until the rule is satisfied.
+
+    Parameters
+    ----------
+    eig_sel_rel : ndarray (nk, n_selected)
+        Selected-band energies at each k-point, relative to E_F.
+    num_wann : int
+        Target number of Wannier functions (max bands allowed per k in window).
+    froz : (float, float)
+        Candidate (froz_min, froz_max), relative to E_F.
+
+    Returns
+    -------
+    (float, float) satisfying the rule, the input unchanged if already valid,
+    or None if no non-empty window can hold <= num_wann bands at every k.
+    """
+    lo, hi = froz
+    n_sel = eig_sel_rel.shape[1]
+    for _ in range(n_sel + 1):
+        inside = (eig_sel_rel >= lo) & (eig_sel_rel <= hi)
+        if int(inside.sum(axis=1).max()) <= num_wann:
+            return (lo, hi)
+        vals = eig_sel_rel[inside]
+        if vals.size == 0:
+            return (lo, hi)
+        new_hi = float(vals.max()) - 1e-6
+        new_lo = float(vals.min()) + 1e-6
+        worst_hi = int(((eig_sel_rel >= lo) & (eig_sel_rel <= new_hi)).sum(axis=1).max())
+        worst_lo = int(((eig_sel_rel >= new_lo) & (eig_sel_rel <= hi)).sum(axis=1).max())
+        if worst_hi <= worst_lo:
+            hi = new_hi
+        else:
+            lo = new_lo
+        if hi <= lo:
+            return None
+    return (lo, hi)
+
+
 def smart_select_bands(
     eigenvectors_list: List[np.ndarray],
     S_k_list: List[np.ndarray],
@@ -237,6 +285,53 @@ def smart_select_bands(
             win_lo = max(win_lo, e_global_min_rel - 1.0)
             win_hi = min(win_hi, e_global_max_rel + 1.0)
             recommended_dis_win = (win_lo, win_hi)
+
+            # Balanced frozen-window policy (k-resolved across the BZ sample).
+            # The frozen energy window spans the frontier bands, but interloper
+            # bands disperse into that range at some k-points (steep bands at the
+            # zone center), so the per-k count can exceed num_frontier and
+            # wannier90 aborts. Rather than aggressively trimming the window
+            # (which would un-freeze good upper frontier bands), we GROW num_wann
+            # to admit those interlopers as Wannier functions -- but only up to a
+            # projectability cap (selected bands that pass proj_threshold), so we
+            # never promote unprojectable junk. If the required count exceeds the
+            # cap, we grow to the cap and then shrink the window to fit. The outer
+            # window above is unaffected (the frozen window stays a subset).
+            eig_sel_rel = all_eigs[:, selected] - e_fermi
+            froz_counts = ((eig_sel_rel >= recommended_dis_froz[0]) &
+                           (eig_sel_rel <= recommended_dis_froz[1])).sum(axis=1)
+            max_in_froz = int(froz_counts.max())
+            if max_in_froz > num_frontier:
+                # Cap: only bands we trust as WFs (pass the projectability filter).
+                projectable_cap = int(np.sum(avg_proj[selected] >= proj_threshold))
+                cap = max(num_frontier, projectable_cap)
+                target_nw = min(max_in_froz, cap)
+                if target_nw >= max_in_froz:
+                    # Keep the full frozen window; raise num_wann to admit interlopers.
+                    if verbose:
+                        print(f"  [frozen-window] keeping window "
+                              f"[{recommended_dis_froz[0]:.3f}, {recommended_dis_froz[1]:.3f}] eV; "
+                              f"raising num_wann {num_frontier} -> {max_in_froz} to admit "
+                              f"{max_in_froz - num_frontier} interloper band(s) "
+                              f"(all pass proj >= {proj_threshold:g})")
+                    recommended_num_wann = max_in_froz
+                else:
+                    # Projectability-capped: grow to the cap, then shrink window.
+                    recommended_num_wann = target_nw
+                    _clamped = _clamp_frozen_window_kresolved(
+                        eig_sel_rel, target_nw, recommended_dis_froz)
+                    if _clamped is None:
+                        recommended_dis_froz = None
+                        if verbose:
+                            print(f"  [frozen-window] num_wann capped at {target_nw} "
+                                  f"(projectability); no valid frozen window -> disabled")
+                    else:
+                        if verbose:
+                            print(f"  [frozen-window] num_wann {num_frontier} -> {target_nw} "
+                                  f"(projectability cap), window clamped "
+                                  f"[{recommended_dis_froz[0]:.3f}, {recommended_dis_froz[1]:.3f}] -> "
+                                  f"[{_clamped[0]:.3f}, {_clamped[1]:.3f}] eV")
+                        recommended_dis_froz = _clamped
         else:
             # All bands are frontier — no disentanglement needed
             recommended_dis_win = None

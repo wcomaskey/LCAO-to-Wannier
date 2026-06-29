@@ -33,6 +33,7 @@ For help:
 import argparse
 import sys
 import os
+import copy
 import numpy as np
 from pathlib import Path
 
@@ -51,6 +52,8 @@ from lcao_wannier import (
 )
 from lcao_wannier.projectability import select_bands_by_projectability, smart_select_bands
 from lcao_wannier.parser import parse_orbital_types
+from lcao_wannier.parser import parse_overlap_and_fock_matrices_streaming
+from lcao_wannier.utils import prune_zero_rvectors
 from lcao_wannier.basis_parser import parse_basis_shells, get_atom_list
 from lcao_wannier.valence_config import (
     build_target_mask, compute_num_wann, summarize_config,
@@ -64,12 +67,144 @@ from lcao_wannier.lcao_pdwf import (
 # Threshold above which --method direct warns the user
 LARGE_BASIS_THRESHOLD = 200
 
+
+def _load_matrices(args):
+    """Load real-space matrices + header, honoring --memory.
+
+    Returns (lines, params, H_R_dict, S_R_dict, lattice_vectors_list).
+
+    * fast (default): legacy behaviour — ``f.readlines()`` the whole file, parse,
+      and organize into dicts. ``lines`` is the full file.
+    * low: single streaming pass (no full readlines, no intermediate matrix
+      list, float64 for non-SOC). ``lines`` is only the pre-matrix header
+      region, which is all the downstream basis/orbital/atom parsers need.
+
+    The two paths produce identical H_R_dict/S_R_dict (validated by
+    scripts/validate_streaming_parser.py); ``low`` just trades the file buffer
+    and a representation copy for a single pass.
+    """
+    low_mem = getattr(args, 'memory', 'fast') == 'low'
+    if low_mem:
+        print("  [memory=low] streaming parse: single pass, "
+              "header-only buffer, float64 for non-SOC")
+        H_R_dict, S_R_dict, lattice_vectors_list, lines = (
+            parse_overlap_and_fock_matrices_streaming(args.input,
+                                                      promote_complex='auto')
+        )
+        params = parse_calculation_parameters(lines)
+        return lines, params, H_R_dict, S_R_dict, lattice_vectors_list
+
+    with open(args.input, 'r') as f:
+        lines = f.readlines()
+    params = parse_calculation_parameters(lines)
+    raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
+    H_R_dict, S_R_dict = {}, {}
+    for mat_info in raw_matrices:
+        R = tuple(mat_info['lattice_vector'])
+        if mat_info['type'] == 'overlap':
+            S_R_dict[R] = mat_info['data']
+        elif mat_info['type'] == 'fock':
+            spin_channel = mat_info.get('spin_channel', 0)
+            H_R_dict.setdefault(R, {})[spin_channel] = mat_info['data']
+    return lines, params, H_R_dict, S_R_dict, lattice_vectors_list
+
 # Maximum allowed discrepancy between CRYSTAL-reported Fermi and
 # HOMO estimated from (eigenvalues, num_electrons). Beyond this, the
 # reported Fermi is deemed inconsistent with the printed H(R) matrices
 # (e.g. SPINLOCK+level-shifter quirk in CRYSTAL23 SOC outputs) and we
 # fall back to the electron-count estimate with a prominent warning.
 FERMI_FRAME_TOLERANCE_EV = 1.0
+
+
+def _check_disentanglement(args, engine, stage):
+    """Validate the just-written .win against Wannier90 disentanglement rules
+    using the engine's per-k eigenvalues. Prints a PASS/FAIL report; never
+    raises (a violation is reported, not fatal, so the user still gets files).
+    """
+    try:
+        from lcao_wannier.wannier_checks import check_seed_windows, format_report
+        win = f"{args.seedname}.win"
+        eigs = getattr(engine, 'eigenvalues_list', None)
+        if not os.path.exists(win) or not eigs:
+            return
+        ef = getattr(engine, 'e_fermi', None) or 0.0
+        band_idx = getattr(engine, 'selected_band_indices', None)
+        if band_idx is not None:
+            eig_per_k = [np.asarray(e)[band_idx] - ef for e in eigs]
+        else:
+            eig_per_k = [np.asarray(e) - ef for e in eigs]
+        rep = check_seed_windows(win, eig_per_k)
+        print(format_report(
+            rep, title=f"Stage {stage} consistency check: {args.seedname}"))
+        if not rep.ok:
+            print("  ⚠ wannier90.x will reject this .win. Adjust the windows "
+                  "(see suggestion) or band selection before running wannier90.")
+    except Exception as exc:
+        print(f"  ⚠ Could not run disentanglement consistency check: {exc}")
+
+
+def _detect_spin_type(filepath, max_lines=20000):
+    """Classify the CRYSTAL calculation from its header.
+
+    Returns one of:
+      'soc'        - two-component / spin-orbit (spinor, channels coupled)
+      'collinear'  - unrestricted spin-polarized (separate ALPHA/BETA Fock)
+      'restricted' - closed-shell or restricted open-shell (single channel)
+
+    Only the header is scanned (the 'TYPE OF CALCULATION' line appears near the
+    top), so this is cheap even on multi-GB files.
+    """
+    soc = unrestricted = restricted = False
+    with open(filepath, 'r', errors='replace') as f:
+        for i, line in enumerate(f):
+            if 'TWO-COMPONENT' in line and 'SCF' in line:
+                soc = True
+            up = line.upper()
+            if 'UNRESTRICTED' in up:
+                unrestricted = True
+            if 'RESTRICTED' in up and 'UNRESTRICTED' not in up:
+                restricted = True
+            if i >= max_lines:
+                break
+    if soc:
+        return 'soc'
+    if unrestricted:
+        return 'collinear'
+    return 'restricted'
+
+
+# Map --spin choice to the CRYSTAL Fock spin-channel key.
+_SPIN_CHANNEL_KEY = {'alpha': 'ALPHA_ALPHA', 'beta': 'BETA_BETA'}
+
+
+def _resolve_spin_runs(args, parser):
+    """Validate --spin against the detected calculation type and return the
+    list of per-run (spin_label, spin_channel_key, seedname) tuples.
+
+    --spin is only meaningful for collinear spin-polarized stage 1/2 runs;
+    on restricted or SOC outputs an explicit --spin is an error.
+    """
+    spin = getattr(args, 'spin', None)
+    if args.stage not in (1, 2):
+        if spin is not None:
+            parser.error("--spin only applies to --stage 1 and 2.")
+        return [(None, None, args.seedname)]
+
+    spin_type = _detect_spin_type(args.input)
+    if spin_type != 'collinear':
+        if spin is not None:
+            parser.error(
+                f"--spin is only valid for collinear spin-polarized "
+                f"(UNRESTRICTED) outputs; this file is '{spin_type}'. "
+                f"Remove --spin.")
+        return [(None, None, args.seedname)]
+
+    # Collinear spin-polarized: default (None) -> both channels.
+    choice = spin or 'both'
+    if choice == 'both':
+        return [('alpha', 'ALPHA_ALPHA', f"{args.seedname}_alpha"),
+                ('beta', 'BETA_BETA', f"{args.seedname}_beta")]
+    return [(choice, _SPIN_CHANNEL_KEY[choice], args.seedname)]
 
 
 def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
@@ -88,6 +223,14 @@ def _sanity_check_fermi_energy(engine, params, args, stage_name=""):
     """
     # User override always wins — they've made a conscious choice.
     if getattr(args, 'fermi_energy', None) is not None:
+        return
+
+    # Spin-polarized single-channel run: the electron-count HOMO estimate needs
+    # the per-spin electron count, which CRYSTAL reports only as a total. Skip
+    # the check and trust the parsed (global) Fermi or an explicit --fermi-energy.
+    if getattr(args, '_spin_label', None) is not None:
+        print(f"  (Skipping electron-count Fermi check for "
+              f"{args._spin_label.upper()} channel; using parsed Fermi.)")
         return
 
     # Can't sanity-check without a parsed Fermi and electron count.
@@ -262,11 +405,112 @@ def _apply_method_projectability(engine, args, has_soc=False):
         engine.selected_band_indices = result.selected_band_indices
         print(f"\nSelected {result.num_wann} bands for Wannier functions")
 
+    _apply_spread_window_assist(engine, args)
+
     # Select projection orbitals
     proj_method = getattr(args, 'projection_method', 'weight')
     print(f"\nSelecting projection orbitals (method={proj_method})...")
     print("-" * 80)
     engine.select_projections(verbose=True, method=proj_method)
+
+
+def _apply_spread_window_assist(engine, args):
+    """Refine dis_froz / dis_win / num_wann to minimize the Wannier spread, using
+    projectability as the localizability proxy and honoring the user minimum
+    frozen window. No-op unless --spread-window-assist is set. Must run AFTER band
+    selection sets engine._dis_froz/_dis_win/num_wann and BEFORE select_projections
+    (so the projection count matches the possibly-updated num_wann).
+    """
+    if not getattr(args, 'spread_window_assist', False):
+        return
+    if not engine.eigenvalues_list:
+        return
+    if getattr(args, 'window_mode', 'manifold') == 'spread':
+        return _apply_spread_window_assist_legacy(engine, args)
+    try:
+        from lcao_wannier.window_assist import manifold_windows
+    except Exception as exc:
+        print(f"  ⚠ spread-window-assist unavailable: {exc}")
+        return
+
+    ef = engine.e_fermi if engine.e_fermi is not None else 0.0
+    eig_all_rel = np.array([np.asarray(e) - ef for e in engine.eigenvalues_list])
+    user_window = tuple(getattr(args, 'min_froz_window', (-6.0, 3.0)))
+
+    res = manifold_windows(eig_all_rel, user_window)
+    if res is None or len(res['band_indices']) == 0:
+        print(f"  [spread-window-assist] no bands in window "
+              f"[{user_window[0]:.2f}, {user_window[1]:.2f}] eV; selection unchanged")
+        return
+
+    nw = res['num_wann']
+    froz = res['dis_froz']
+    win = res['dis_win']
+    idx = res['band_indices']
+    # The user window is a REGION OF INTEREST. num_wann = the bands passing
+    # through it; dis_froz grows to the full ISOLATED extent of those bands;
+    # dis_win spans the bands that connect to them; num_bands = the pool.
+    print(f"\n  [spread-window-assist] band-structure target from window "
+          f"[{user_window[0]:.2f}, {user_window[1]:.2f}] eV:")
+    print(f"    {nw} bands pass through the window -> num_wann = {nw}")
+    print(f"    dis_froz: [{froz[0]:.3f}, {froz[1]:.3f}] eV (full isolated extent "
+          f"of the near-E_F bands)")
+    print(f"    dis_win:  [{win[0]:.3f}, {win[1]:.3f}] eV (connecting bands; "
+          f"{len(idx)} bands in pool)")
+
+    engine.selected_band_indices = np.asarray(idx, dtype=int)
+    engine.num_wann = int(nw)
+    engine._num_bands_for_win = int(len(idx))
+    engine._dis_froz = (float(froz[0]), float(froz[1]))
+    engine._dis_win = None if len(idx) == nw else (float(win[0]), float(win[1]))
+
+
+def _apply_spread_window_assist_legacy(engine, args):
+    """'spread' window mode: keep the method's num_wann, grow the outer window to
+    >= num_wann bands/k (preferring the valence side) using projectability as the
+    localizability proxy. See --window-mode."""
+    if engine.selected_band_indices is None:
+        return
+    try:
+        from lcao_wannier.projectability import compute_band_projectability
+        from lcao_wannier.window_assist import spread_minimizing_windows
+    except Exception as exc:
+        print(f"  ⚠ spread-window-assist unavailable: {exc}")
+        return
+
+    ef = engine.e_fermi if engine.e_fermi is not None else 0.0
+    bands = np.asarray(engine.selected_band_indices)
+    eig_sel_rel = np.array([np.asarray(e)[bands] - ef for e in engine.eigenvalues_list])
+    proj_pk = getattr(engine, '_band_projectability', None)
+    if proj_pk is None:
+        proj_pk = compute_band_projectability(engine.eigenvectors_list,
+                                              engine.S_k_list)
+    proj_pk = np.asarray(proj_pk)
+    proj_avg = np.mean(proj_pk, axis=0) if proj_pk.ndim == 2 else proj_pk
+    proj_sel = proj_avg[bands]
+
+    min_froz = tuple(getattr(args, 'min_froz_window', (-6.0, 3.0)))
+    floor = getattr(args, 'assist_proj_floor', None)
+    if floor is None:
+        floor = getattr(args, 'proj_threshold', 0.9)
+
+    res = spread_minimizing_windows(eig_sel_rel, proj_sel, engine.num_wann,
+                                    min_froz, proj_floor=floor)
+    print("\n  [spread-window-assist:spread] minimizing spread (projectability "
+          f"proxy; min frozen [{min_froz[0]:.2f}, {min_froz[1]:.2f}] eV):")
+    if engine._dis_froz is not None:
+        print(f"    dis_froz: [{engine._dis_froz[0]:.3f}, {engine._dis_froz[1]:.3f}]"
+              f" -> [{res.dis_froz[0]:.3f}, {res.dis_froz[1]:.3f}] eV")
+    if engine._dis_win is not None:
+        print(f"    dis_win:  [{engine._dis_win[0]:.3f}, {engine._dis_win[1]:.3f}]"
+              f" -> [{res.dis_win[0]:.3f}, {res.dis_win[1]:.3f}] eV")
+    if res.num_wann != engine.num_wann:
+        print(f"    num_wann: {engine.num_wann} -> {res.num_wann}")
+    for note in res.notes:
+        print(f"    note: {note}")
+    engine.num_wann = res.num_wann
+    engine._dis_froz = res.dis_froz
+    engine._dis_win = res.dis_win
 
 
 def _apply_method_pdwf(engine, args, has_soc, lines):
@@ -295,9 +539,14 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
 
     # Phase 2: Build target mask
     print("  Phase 2: Building target orbital mask...")
+    # CRYSTAL emits multi-zeta LCAO bases where valence character is spread
+    # across several radial functions, and the first valence radial can be a
+    # semicore function. Target ALL radials of the valence l-channels so the
+    # near-E_F bands project correctly (the energy cutoff drops deep semicore).
+    all_radials = not getattr(args, 'pdwf_first_radial_only', False)
     target_mask = build_target_mask(
         shells, extended=extended, include_tm_p=include_tm_p,
-        has_soc=has_soc, verbose=True,
+        has_soc=has_soc, verbose=True, all_radials=all_radials,
     )
     num_wann = compute_num_wann(
         atoms, extended=extended, include_tm_p=include_tm_p,
@@ -333,6 +582,10 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
         engine.eigenvectors_list, engine.S_k_list, target_mask,
     )
     print(f"    Projectability range: [{np.min(proj):.4f}, {np.max(proj):.4f}]")
+    # Expose Lowdin (target) projectability for the spread-window-assist so it
+    # excludes diffuse bands by their REAL atomic character, not by projection
+    # onto the full basis (which over-counts high-energy states).
+    engine._band_projectability = np.asarray(proj)
 
     # Phase 4: Classify bands
     print("\n  Phase 4: Classifying bands...")
@@ -461,6 +714,10 @@ def _apply_method_pdwf(engine, args, has_soc, lines):
     # (projects onto ALL target AOs, then SVD selects optimal num_wann subspace)
     engine.pdwf_target_mask = target_mask
     engine.selected_orbital_indices = None  # Not used with PDWF Amn
+
+    # Optional spread-minimization window assist (refines _dis_froz/_dis_win/
+    # num_wann; the SVD-based PDWF Amn adapts to the updated num_wann).
+    _apply_spread_window_assist(engine, args)
 
     if windows.dis_win_min is not None and len(all_active) > num_wann:
         ratio = len(all_active) / num_wann
@@ -897,6 +1154,8 @@ def _apply_method_window(engine, args):
         print(f"Selected {num_bands_in_window} bands for Wannier functions")
         print(f"  Energy range: [{result.frozen_energy_range[0]:.2f}, {result.frozen_energy_range[1]:.2f}] eV")
 
+    _apply_spread_window_assist(engine, args)
+
     # Select projection orbitals
     proj_method = getattr(args, 'projection_method', 'weight')
     print(f"\nSelecting projection orbitals (method={proj_method})...")
@@ -1141,10 +1400,7 @@ def stage1_create_win(args):
     print("Step 1: Parsing CRYSTAL/LCAO output file...")
     print("-" * 80)
 
-    with open(args.input, 'r') as f:
-        lines = f.readlines()
-
-    params = parse_calculation_parameters(lines)
+    lines, params, H_R_dict, S_R_dict, lattice_vectors_list = _load_matrices(args)
     # Apply user --k-grid override (for memory-limited systems or 2D slabs)
     if getattr(args, 'k_grid', None) is not None:
         original_kgrid = params.k_grid
@@ -1157,7 +1413,6 @@ def stage1_create_win(args):
         params.fermi_energy = float(args.fermi_energy)
         print(f"  Overriding Fermi energy: {original_fermi} eV -> "
               f"{params.fermi_energy} eV (user --fermi-energy)")
-    raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
     print(f"✓ Parsed calculation parameters:")
@@ -1181,20 +1436,7 @@ def stage1_create_win(args):
     print("\nStep 2: Organizing matrices...")
     print("-" * 80)
 
-    H_R_dict = {}
-    S_R_dict = {}
-    for mat_info in raw_matrices:
-        R = tuple(mat_info['lattice_vector'])
-        mat_type = mat_info['type']
-        data = mat_info['data']
-
-        if mat_type == 'overlap':
-            S_R_dict[R] = data
-        elif mat_type == 'fock':
-            spin_channel = mat_info.get('spin_channel', 0)
-            if R not in H_R_dict:
-                H_R_dict[R] = {}
-            H_R_dict[R][spin_channel] = data
+    # H_R_dict / S_R_dict were built in _load_matrices() (honoring --memory)
 
     num_basis = params.num_ao if params.num_ao else list(S_R_dict.values())[0].shape[0]
     print(f"✓ Organized matrices")
@@ -1215,7 +1457,8 @@ def stage1_create_win(args):
     else:
         # For non-SOC, symmetrize lower-triangular raw matrices using R/-R pairs
         H_full_list, S_full_list = create_nonsoc_full_matrices(
-            H_R_dict, S_R_dict, lattice_vectors_list
+            H_R_dict, S_R_dict, lattice_vectors_list,
+            spin_channel=getattr(args, '_spin_channel', None)
         )
         matrix_size = num_basis
         print(f"✓ Created {matrix_size}×{matrix_size} symmetrized matrices (no SOC)")
@@ -1227,6 +1470,11 @@ def stage1_create_win(args):
     real_space_matrices = prepare_real_space_matrices(
         H_full_list, S_full_list, lattice_vectors
     )
+    if not getattr(args, 'no_prune', False):
+        real_space_matrices, _ = prune_zero_rvectors(
+            real_space_matrices,
+            threshold=getattr(args, 'prune_threshold', 0.0),
+        )
     print(f"✓ Prepared {len(real_space_matrices)} R-vectors")
 
     # Initialize engine (window only needed for window-based fallback)
@@ -1255,8 +1503,9 @@ def stage1_create_win(args):
     # Parse atomic basis information for phase-corrected MMN
     print("\nParsing atomic basis information...")
     try:
-        with open(args.input, 'r') as f:
-            lines = f.readlines()
+        if getattr(args, 'memory', 'fast') != 'low':
+            with open(args.input, 'r') as f:
+                lines = f.readlines()
         atomic_info = parse_atomic_basis_info(lines)
         engine.atom_positions = atomic_info.atom_positions
 
@@ -1315,7 +1564,15 @@ def stage1_create_win(args):
     elif args.method == 'direct':
         _apply_method_direct(engine, args, has_soc, params)
     elif args.method in ('pdwf', 'auto'):
-        _apply_method_pdwf(engine, args, has_soc, lines)
+        try:
+            _apply_method_pdwf(engine, args, has_soc, lines)
+        except (Exception, SystemExit) as exc:
+            if args.method == 'auto':
+                print(f"\n  ⚠ PDWF method failed ({type(exc).__name__}: {exc}); "
+                      f"falling back to projectability method.")
+                _apply_method_projectability(engine, args, has_soc=has_soc)
+            else:
+                raise
     elif args.method == 'projectability':
         if args.window:
             print(f"Using explicit energy window: [{e_min:.2f}, {e_max:.2f}] eV")
@@ -1362,14 +1619,26 @@ def stage1_create_win(args):
     kpoint_path = None
     if args.bands_plot:
         from lcao_wannier.win_file import (
-            KPATH_HEXAGONAL_2D, KPATH_SIMPLE_CUBIC, KPATH_FCC, KPATH_BCC
+            KPATH_HEXAGONAL_2D, KPATH_HEXAGONAL_3D, KPATH_SIMPLE_CUBIC,
+            KPATH_FCC, KPATH_BCC
         )
+        custom = getattr(args, 'custom_kpath', None)
         lv = engine.lattice_vectors
         a1_len = np.linalg.norm(lv[0])
         a2_len = np.linalg.norm(lv[1])
         a3_len = np.linalg.norm(lv[2])
 
-        if a3_len > 10 * a1_len:
+        if custom:
+            # User-specified path: "G:0,0,0;M:0.5,0,0;K:0.33,0.33,0;G:0,0,0"
+            pts = []
+            for tok in custom.split(';'):
+                label, coords = tok.split(':')
+                pts.append((label, np.array([float(x) for x in coords.split(',')])))
+            kpoint_path = []
+            for i in range(len(pts) - 1):
+                kpoint_path += [pts[i], pts[i + 1]]
+            print(f"  Using user --custom-kpath ({len(pts)} high-symmetry points)")
+        elif a3_len > 10 * a1_len:
             # 2D system: large vacuum along a3
             kpoint_path = KPATH_HEXAGONAL_2D
             print(f"  Auto-detected 2D hexagonal lattice -> Gamma-M-K band path")
@@ -1398,6 +1667,20 @@ def stage1_create_win(args):
                     kpoint_path = KPATH_BCC
                     print(f"  Auto-detected BCC-like lattice -> Gamma-H-N-P band path")
 
+            # Hexagonal: two 90-deg angles + one 120-deg (or 60), two equal axes.
+            # (which vector pair carries the 120 varies, so check order-independently)
+            n_120 = sum(1 for a in (alpha, beta, gamma)
+                        if abs(a - 120.0) < 2.0 or abs(a - 60.0) < 2.0)
+            n_90 = sum(1 for a in (alpha, beta, gamma) if abs(a - 90.0) < 2.0)
+            two_equal = (abs(a1_len - a2_len) < 0.02 * a1_len
+                         or abs(a1_len - a3_len) < 0.02 * a1_len
+                         or abs(a2_len - a3_len) < 0.02 * a2_len)
+            hex_like = (n_120 == 1 and n_90 == 2 and two_equal)
+            if kpoint_path is None and hex_like:
+                kpoint_path = KPATH_HEXAGONAL_3D
+                print(f"  Auto-detected 3D hexagonal lattice -> "
+                      f"Gamma-M-K-Gamma-A-L-H-A band path")
+
             if kpoint_path is None:
                 print(f"  Could not auto-detect lattice type for band path")
                 print(f"  Lattice lengths: {lengths}, angles: {angles}")
@@ -1421,6 +1704,11 @@ def stage1_create_win(args):
         if os.path.exists(filepath):
             os.remove(filepath)
             print(f"  (Removed premature {filepath})")
+
+    # Consistency check: does the generated .win satisfy Wannier90's
+    # disentanglement rules at every k-point? (Catches steep bands entering the
+    # frozen window before the user runs wannier90.x -- see wannier_checks.)
+    _check_disentanglement(args, engine, stage=1)
 
     print()
     print("=" * 80)
@@ -1480,10 +1768,7 @@ def stage2_create_data_files(args):
     print("Step 1: Parsing CRYSTAL/LCAO output file...")
     print("-" * 80)
 
-    with open(args.input, 'r') as f:
-        lines = f.readlines()
-
-    params = parse_calculation_parameters(lines)
+    lines, params, H_R_dict, S_R_dict, lattice_vectors_list = _load_matrices(args)
     # Apply user --k-grid override (for memory-limited systems or 2D slabs)
     if getattr(args, 'k_grid', None) is not None:
         original_kgrid = params.k_grid
@@ -1496,7 +1781,6 @@ def stage2_create_data_files(args):
         params.fermi_energy = float(args.fermi_energy)
         print(f"  Overriding Fermi energy: {original_fermi} eV -> "
               f"{params.fermi_energy} eV (user --fermi-energy)")
-    raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
     print(f"✓ Parsed calculation parameters:")
@@ -1520,20 +1804,7 @@ def stage2_create_data_files(args):
     print("\nStep 2: Organizing matrices...")
     print("-" * 80)
 
-    H_R_dict = {}
-    S_R_dict = {}
-    for mat_info in raw_matrices:
-        R = tuple(mat_info['lattice_vector'])
-        mat_type = mat_info['type']
-        data = mat_info['data']
-
-        if mat_type == 'overlap':
-            S_R_dict[R] = data
-        elif mat_type == 'fock':
-            spin_channel = mat_info.get('spin_channel', 0)
-            if R not in H_R_dict:
-                H_R_dict[R] = {}
-            H_R_dict[R][spin_channel] = data
+    # H_R_dict / S_R_dict were built in _load_matrices() (honoring --memory)
 
     num_basis = params.num_ao if params.num_ao else list(S_R_dict.values())[0].shape[0]
     print(f"✓ Organized matrices")
@@ -1554,7 +1825,8 @@ def stage2_create_data_files(args):
     else:
         # For non-SOC, symmetrize lower-triangular raw matrices using R/-R pairs
         H_full_list, S_full_list = create_nonsoc_full_matrices(
-            H_R_dict, S_R_dict, lattice_vectors_list
+            H_R_dict, S_R_dict, lattice_vectors_list,
+            spin_channel=getattr(args, '_spin_channel', None)
         )
         matrix_size = num_basis
         print(f"✓ Created {matrix_size}×{matrix_size} symmetrized matrices (no SOC)")
@@ -1566,6 +1838,11 @@ def stage2_create_data_files(args):
     real_space_matrices = prepare_real_space_matrices(
         H_full_list, S_full_list, lattice_vectors
     )
+    if not getattr(args, 'no_prune', False):
+        real_space_matrices, _ = prune_zero_rvectors(
+            real_space_matrices,
+            threshold=getattr(args, 'prune_threshold', 0.0),
+        )
     print(f"✓ Prepared {len(real_space_matrices)} R-vectors")
 
     # Read num_wann and num_bands from .win file if it exists
@@ -1641,8 +1918,9 @@ def stage2_create_data_files(args):
     # Parse atomic basis information for phase-corrected MMN
     print("\nParsing atomic basis information...")
     try:
-        with open(args.input, 'r') as f:
-            lines = f.readlines()
+        if getattr(args, 'memory', 'fast') != 'low':
+            with open(args.input, 'r') as f:
+                lines = f.readlines()
         atomic_info = parse_atomic_basis_info(lines)
         engine.atom_positions = atomic_info.atom_positions
 
@@ -1789,7 +2067,15 @@ def stage2_create_data_files(args):
     elif args.method == 'symmetry':
         _apply_method_symmetry(engine, args, has_soc, params, lines)
     elif args.method in ('pdwf', 'auto'):
-        _apply_method_pdwf(engine, args, has_soc, lines)
+        try:
+            _apply_method_pdwf(engine, args, has_soc, lines)
+        except (Exception, SystemExit) as exc:
+            if args.method == 'auto':
+                print(f"\n  ⚠ PDWF method failed ({type(exc).__name__}: {exc}); "
+                      f"falling back to projectability method.")
+                _apply_method_projectability(engine, args, has_soc=has_soc)
+            else:
+                raise
     elif args.method == 'direct':
         _apply_method_direct(engine, args, has_soc, params)
     elif args.method == 'projectability':
@@ -1848,7 +2134,13 @@ def stage2_create_data_files(args):
 
         site_symmetry=getattr(args, 'site_symmetry', False),
 
+        mmn_method=getattr(args, 'mmn_method', 'midpoint'),
+
     )
+
+    # Consistency check: confirm the existing .win still satisfies the
+    # disentanglement rules against the .eig bands we just wrote.
+    _check_disentanglement(args, engine, stage=2)
 
     print()
     print("=" * 80)
@@ -2203,10 +2495,7 @@ def stage4_plot_bands(args):
     print("Step 1: Parsing CRYSTAL/LCAO output file...")
     print("-" * 80)
 
-    with open(args.input, 'r') as f:
-        lines = f.readlines()
-
-    params = parse_calculation_parameters(lines)
+    lines, params, H_R_dict, S_R_dict, lattice_vectors_list = _load_matrices(args)
     # Apply user --k-grid override (for memory-limited systems or 2D slabs)
     if getattr(args, 'k_grid', None) is not None:
         original_kgrid = params.k_grid
@@ -2219,7 +2508,6 @@ def stage4_plot_bands(args):
         params.fermi_energy = float(args.fermi_energy)
         print(f"  Overriding Fermi energy: {original_fermi} eV -> "
               f"{params.fermi_energy} eV (user --fermi-energy)")
-    raw_matrices, lattice_vectors_list = parse_overlap_and_fock_matrices(lines)
     lattice_vectors = np.array(lattice_vectors_list)
 
     has_soc = params.has_soc
@@ -2228,20 +2516,7 @@ def stage4_plot_bands(args):
     print(f"  SOC: {'Yes' if has_soc else 'No'}")
 
     # Organize matrices
-    H_R_dict = {}
-    S_R_dict = {}
-    for mat_info in raw_matrices:
-        R = tuple(mat_info['lattice_vector'])
-        mat_type = mat_info['type']
-        data = mat_info['data']
-
-        if mat_type == 'overlap':
-            S_R_dict[R] = data
-        elif mat_type == 'fock':
-            spin_channel = mat_info.get('spin_channel', 0)
-            if R not in H_R_dict:
-                H_R_dict[R] = {}
-            H_R_dict[R][spin_channel] = data
+    # H_R_dict / S_R_dict were built in _load_matrices() (honoring --memory)
 
     # Create full matrices
     if has_soc:
@@ -2250,12 +2525,18 @@ def stage4_plot_bands(args):
         )
     else:
         H_full_list, S_full_list = create_nonsoc_full_matrices(
-            H_R_dict, S_R_dict, lattice_vectors_list
+            H_R_dict, S_R_dict, lattice_vectors_list,
+            spin_channel=getattr(args, '_spin_channel', None)
         )
 
     real_space_matrices = prepare_real_space_matrices(
         H_full_list, S_full_list, lattice_vectors
     )
+    if not getattr(args, 'no_prune', False):
+        real_space_matrices, _ = prune_zero_rvectors(
+            real_space_matrices,
+            threshold=getattr(args, 'prune_threshold', 0.0),
+        )
     print(f"  {len(real_space_matrices)} R-vectors")
 
     # ---- PDWF analysis on uniform grid (unless --no-pdwf) ----
@@ -2491,14 +2772,80 @@ EXAMPLES:
                         help='Enable band structure plotting in Wannier90')
     parser.add_argument('--no-parallel', action='store_true',
                         help='Disable parallel computation')
+    parser.add_argument('--memory', type=str, choices=['fast', 'low'],
+                        default='fast',
+                        help='Memory strategy. fast (default): legacy in-RAM '
+                             'parse. low: single streaming pass — no full-file '
+                             'buffer, no intermediate matrix list, float64 for '
+                             'non-SOC. Cuts peak RSS ~2-3x for large inputs at '
+                             'no speed cost (parsing dominates). Use for files '
+                             'that approach available RAM (see '
+                             'scripts/estimate_memory.py).')
+    parser.add_argument('--spin', choices=['alpha', 'beta', 'both'], default=None,
+                        help='Collinear spin-polarized (UNRESTRICTED) outputs '
+                             'only (stages 1-2). alpha/beta: Wannierize that '
+                             'channel using the given seedname. both: two '
+                             'independent runs -> <seed>_alpha and <seed>_beta '
+                             '(sharing the overlap S(R)). Default on a '
+                             'spin-polarized file is both. Error on restricted '
+                             'or two-component SOC outputs.')
+    parser.add_argument('--no-prune', action='store_true',
+                        help='Do not drop all-zero R-vectors. By default, cells '
+                             'whose H(R) and S(R) are exactly zero (CRYSTAL emits '
+                             'more real-space cells than needed) are removed — '
+                             'this is bit-identical and shrinks the stacked '
+                             'arrays / Fourier cost.')
+    parser.add_argument('--prune-threshold', type=float, default=0.0,
+                        help='Prune R-vectors with max|H(R)|,max|S(R)| <= this '
+                             '(default: 0.0 = exact zeros only, result-preserving). '
+                             'A small value (e.g. 1e-10) also drops negligible '
+                             'cells but may change results slightly.')
+    parser.add_argument('--spread-window-assist', action='store_true',
+                        help='Refine the disentanglement windows to minimize the '
+                             'Wannier spread: keep the subspace projectable '
+                             '(exclude diffuse, low-projectability bands that '
+                             'inflate Omega_I) while honoring --min-froz-window. '
+                             'Stages 1-2, projectability/pdwf methods.')
+    parser.add_argument('--min-froz-window', type=float, nargs=2,
+                        metavar=('LO', 'HI'), default=[-6.0, 3.0],
+                        help='Minimum frozen window (eV relative to E_F) that the '
+                             'spread-window-assist must always keep frozen -- the '
+                             'band-structure target reproduced exactly by the '
+                             'interpolation (default: -6.0 3.0, deeper into the '
+                             'valence than the conduction side). If it holds more '
+                             'than num_wann bands/k, num_wann is raised to honor it.')
+    parser.add_argument('--assist-proj-floor', type=float, default=None,
+                        help='Projectability below which a band is treated as '
+                             'diffuse by --spread-window-assist (default: '
+                             '--proj-threshold). Raise it to exclude more bands '
+                             'and tighten localization.')
+    parser.add_argument('--mmn-method', type=str, default='midpoint',
+                        choices=['midpoint', 'lowdin', 'lowdin_no_berry'],
+                        help="Algorithm for the .mmn overlaps. 'midpoint' "
+                             "(default): S evaluated at k+b/2 (accurate on dense "
+                             "grids, non-unitary on coarse ones). 'lowdin': "
+                             "Lowdin-orthonormalized overlaps with explicit Berry "
+                             "phase (singular values bounded [0,1]). "
+                             "'lowdin_no_berry': same without the explicit phase.")
+    parser.add_argument('--window-mode', type=str, default='manifold',
+                        choices=['manifold', 'spread'],
+                        help="How --spread-window-assist positions the windows. "
+                             "'manifold' (default): the --min-froz-window is a "
+                             "region of interest; num_wann = the bands passing "
+                             "through it, and the disentanglement window follows "
+                             "those bands to their full extent (deep valence, "
+                             "shallow conduction). 'spread': keep the method's "
+                             "num_wann and grow the outer window to >= num_wann "
+                             "bands/k preferring the valence side.")
 
     # Method selection
     parser.add_argument('--method', type=str,
                         choices=['projectability', 'direct', 'symmetry', 'pdwf', 'auto'],
-                        default='projectability',
-                        help='Wannierization method (default: projectability). '
+                        default='auto',
+                        help='Wannierization method (default: auto). '
                              'pdwf: LCAO-PDWF chemistry-grounded band selection. '
-                             'auto: try pdwf, fall back to projectability.')
+                             'auto: try pdwf, fall back to projectability. '
+                             'projectability: energy-window + projectability.')
     parser.add_argument('--proj-threshold', type=float, default=0.9,
                         help='Projectability threshold for band selection '
                              '(default: 0.9, used with --method projectability)')
@@ -2595,15 +2942,31 @@ EXAMPLES:
 
     args = parser.parse_args()
 
-    # Execute appropriate stage
-    if args.stage == 1:
-        stage1_create_win(args)
-    elif args.stage == 2:
-        stage2_create_data_files(args)
-    elif args.stage == 3:
-        stage3_symmetrize_hr(args)
-    elif args.stage == 4:
-        stage4_plot_bands(args)
+    stage_fns = {
+        1: stage1_create_win,
+        2: stage2_create_data_files,
+        3: stage3_symmetrize_hr,
+        4: stage4_plot_bands,
+    }
+    stage_fn = stage_fns[args.stage]
+
+    # Resolve spin handling: collinear spin-polarized stage 1/2 runs may expand
+    # into two independent (alpha, beta) runs; everything else runs once.
+    spin_runs = _resolve_spin_runs(args, parser)
+
+    for spin_label, spin_channel, seedname in spin_runs:
+        run_args = args
+        if spin_label is not None:
+            run_args = copy.copy(args)
+            run_args.seedname = seedname
+            run_args._spin_channel = spin_channel
+            run_args._spin_label = spin_label
+            if len(spin_runs) > 1:
+                print("\n" + "#" * 72)
+                print(f"# SPIN-POLARIZED RUN: {spin_label.upper()} channel "
+                      f"-> seedname '{seedname}'")
+                print("#" * 72)
+        stage_fn(run_args)
 
 
 if __name__ == '__main__':

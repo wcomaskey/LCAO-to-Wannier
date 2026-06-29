@@ -115,6 +115,46 @@ python3 lcao_to_wannier90.py \
 
 ---
 
+## Memory, Spin & Validation Options
+
+### Spin-polarized (UNRESTRICTED) outputs
+
+```bash
+# Both spin channels -> NAME_alpha.* and NAME_beta.* (default for spin-polarized)
+python3 lcao_to_wannier90.py --stage 1 --input INPUT.out --seedname NAME --spin both
+wannier90.x -pp NAME_alpha   # run -pp per channel
+wannier90.x -pp NAME_beta
+python3 lcao_to_wannier90.py --stage 2 --input INPUT.out --seedname NAME --spin both
+
+# A single channel (uses NAME as-is)
+python3 lcao_to_wannier90.py --stage 1 --input INPUT.out --seedname NAME --spin alpha
+```
+`--spin` errors on restricted or two-component SOC outputs (it does not apply).
+
+### Large inputs (low memory)
+
+```bash
+# Predict peak RAM first
+python3 scripts/estimate_memory.py INPUT.out --available 26
+
+# Streaming, low-memory parse (~2x lower peak; default prunes all-zero R-vectors)
+python3 lcao_to_wannier90.py --stage 1 --input INPUT.out --seedname NAME --memory low
+#   --no-prune              keep all-zero R-vectors
+#   --prune-threshold 1e-10 also drop negligible cells
+```
+
+### Validate a .win before running wannier90
+
+```bash
+# Stage 1/2 already print a PASS/FAIL disentanglement check automatically.
+# To re-check an existing seedname (.win + .eig):
+python3 scripts/check_win.py NAME
+```
+See `DISENTANGLEMENT_WINDOW_RULES.md` for what is checked and the frozen-window
+rule.
+
+---
+
 ## File Locations
 
 ### Generated Files

@@ -5,6 +5,62 @@ All notable changes to the LCAO-to-Wannier90 package will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-06-26
+
+### Fixed - CRITICAL (disentanglement frozen window)
+- **Frozen (inner) disentanglement window now respects the k-resolved band-count
+  rule across the full BZ sample.** Previously the frozen window was sized to the
+  frontier bands' energy span and `num_wann` was set to the frontier-band count,
+  but the window is an *energy interval*: interloper bands that disperse into that
+  range at some k-points (e.g. steep bands at the zone center) were never counted.
+  At those k-points the number of bands inside the window exceeded `num_wann`, so
+  `wannier90.x` aborted with *"dis_windows: More states in the frozen window than
+  target WFs"*. The window is now clamped using the per-k eigenvalues
+  (`_clamp_frozen_window_kresolved` in `projectability.py`) so that **at every
+  k-point at most `num_wann` selected bands lie inside the frozen window**.
+  Example: a 9 k-point 2D Sc slab had 76 bands in the window at the zone center
+  vs. `num_wann=51`; the clamp produces a valid window automatically.
+
+### Added - Consistency checks
+- **`lcao_wannier/wannier_checks.py`** — validates a Wannier90 setup against the
+  hard disentanglement rules using the actual per-k eigenvalues: frozen window
+  `<= num_wann` bands at every k, outer window `>= num_wann` bands at every k,
+  frozen window contained in the outer window, `num_bands >= num_wann`. Reports
+  the worst k-point and a suggested `dis_froz_max`.
+- **Automatic checks after Stage 1 and Stage 2** (`_check_disentanglement`):
+  every run prints a PASS/FAIL report so a bad `.win` is caught *before* running
+  `wannier90.x`. Non-fatal (files are still written).
+- **`scripts/check_win.py <seedname>`** — standalone checker for any existing
+  `.win` + `.eig` pair.
+
+### Added - Collinear spin-polarized support
+- **`--spin {alpha, beta, both}`** flag (stages 1-2) for UNRESTRICTED
+  spin-polarized CRYSTAL outputs. `alpha`/`beta` Wannierize a single channel
+  under the given seedname; `both` performs two independent runs writing
+  `<seed>_alpha` and `<seed>_beta` (sharing the spin-independent overlap `S(R)`),
+  matching the standard Quantum ESPRESSO + Wannier90 collinear workflow.
+- Calculation type is auto-detected (`_detect_spin_type`: restricted / collinear
+  / two-component SOC). `--spin` is rejected on restricted and SOC outputs.
+- Previously the non-SOC path silently used only the first spin channel (ALPHA)
+  and discarded BETA; spin-polarized results were therefore incomplete.
+
+### Added - Memory efficiency
+- **`--memory low`** — single streaming pass over the CRYSTAL output: no
+  `readlines()` of the whole file, no intermediate matrix list, and `float64`
+  real-space matrices for non-SOC systems. Cuts peak RSS ~2x with no speed cost
+  (parsing, not linear algebra, dominates large runs).
+- **Zero-R-vector pruning** (default on, `--no-prune` to disable,
+  `--prune-threshold` to tune) — drops cells whose `H(R)` and `S(R)` are zero
+  (CRYSTAL emits more real-space cells than physically needed). Bit-identical for
+  exact zeros; shrinks the stacked arrays and Fourier cost. A 4.6 GB Sc slab went
+  from 101 to 7 non-zero R-vectors.
+- **`scripts/estimate_memory.py`** — predicts peak RSS for a given input from a
+  cheap streaming scan, with a FITS / TIGHT / WILL-OOM verdict.
+
+### Documentation
+- New `docs/guides/DISENTANGLEMENT_WINDOW_RULES.md` explaining the frozen/outer
+  window rules, the consistency checks, and the spin/memory flags.
+
 ## [1.2.0] - 2025-01-01
 
 ### Added - CRITICAL FEATURE

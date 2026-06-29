@@ -1,6 +1,6 @@
 # LCAO to Wannier90 Conversion Package
 
-Version 1.3.0
+Version 1.4.0
 
 ## Overview
 
@@ -34,6 +34,17 @@ Follow the printed instructions for preprocessing and Stage 2.
 - Disentanglement support for optimal Wannier function localization
 - Numerical verification and validation routines
 - Parallel processing support for large k-point grids
+
+### New in v1.4.0
+
+✅ **Disentanglement consistency checks** — Stage 1/2 validate the `.win` against
+   Wannier90's k-resolved window rules and catch a too-wide frozen window before
+   `wannier90.x` aborts (see [docs/guides/DISENTANGLEMENT_WINDOW_RULES.md](docs/guides/DISENTANGLEMENT_WINDOW_RULES.md))
+✅ **Frozen-window fix** — the inner window is now clamped using the full BZ
+   sample so interloper bands at the zone center never exceed `num_wann`
+✅ **Collinear spin-polarized support** — `--spin {alpha,beta,both}` (was: BETA silently dropped)
+✅ **Low-memory mode** — `--memory low` streaming parser + zero-R-vector pruning (~2x lower peak RSS)
+✅ **Memory estimator** — `scripts/estimate_memory.py` predicts peak RAM before a run
 
 ### Recent Fixes (v1.3.0)
 

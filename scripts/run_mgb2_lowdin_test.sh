@@ -1,0 +1,29 @@
+#!/bin/bash
+# Coarse-grid (8x8x8) MgB2 MMN-method comparison: lowdin vs lowdin_no_berry vs
+# midpoint. Plain PDWF, same windows/projections. Goal: does a Lowdin MMN give
+# positive Omega_I + low RMS where midpoint gives Omega_I=-10, RMS=255?
+set -u
+REPO=/mnt/c/Users/willi/OneDrive/Desktop/LCAO-to-Wannier
+export PYTHONPATH=$REPO
+export OMP_NUM_THREADS=14 OPENBLAS_NUM_THREADS=14
+export LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64:/opt/intel/oneapi/mkl/latest/lib:/opt/intel/oneapi/compiler/2025.1/lib:${LD_LIBRARY_PATH:-}
+W90=/home/wcom/wannier90/wannier90.x
+IN=$REPO/calculations/MgB2_basis_121.out
+SEED=MgB2
+BASEARGS="--spin alpha --method pdwf --k-grid 8 8 8"
+
+for METHOD in lowdin lowdin_no_berry; do
+  echo "################ MMN method: $METHOD ################"
+  WORK=$HOME/mgb2_${METHOD}; rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK" || exit 1
+  python3 "$REPO/lcao_to_wannier90.py" --stage 1 --input "$IN" --seedname "$SEED" $BASEARGS --bands-plot 2>&1 \
+      | grep -iE 'num_wann:|Created:' | head -2
+  $W90 -pp "$SEED" 2>&1 | grep -iE 'Exiting|Error'
+  python3 "$REPO/lcao_to_wannier90.py" --stage 2 --input "$IN" --seedname "$SEED" $BASEARGS \
+      --mmn-method "$METHOD" 2>&1 | grep -iE '\.mmn:|Lowdin|Self-overlap|k=0:'
+  $W90 "$SEED" 2>&1 | grep -iE 'Exiting|Error' | head -2
+  grep -E 'Omega I +=|Omega Total' "$SEED.wout" | tail -2
+  python3 "$REPO/scripts/plot_band_comparison.py" --input "$IN" --seedname "$SEED" \
+      --spin alpha --ylim -16 12 -o "${SEED}_${METHOD}.png" 2>&1 | grep -iE 'RMS'
+  cp "${SEED}_${METHOD}.png" "/mnt/c/Users/willi/AppData/Local/Temp/claude/C--Users-willi-OneDrive-Desktop-LCAO-to-Wannier/c42bf54e-fde7-4c6c-bfca-046026b0fad2/scratchpad/${SEED}_${METHOD}.png" 2>/dev/null
+done
+echo "=== DONE $(date) ==="

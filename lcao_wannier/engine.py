@@ -712,7 +712,9 @@ class Wannier90Engine:
         atom_positions_frac: Optional[np.ndarray] = None,
         atom_numbers: Optional[np.ndarray] = None,
 
-        site_symmetry: bool = False
+        site_symmetry: bool = False,
+
+        mmn_method: str = 'midpoint'
 
     ) -> None:
         """
@@ -968,7 +970,7 @@ class Wannier90Engine:
                 verbose=verbose,
                 stacked=self._stacked,
                 unitarize=False,
-                method='midpoint',
+                method=mmn_method,
                 S_k_list=self.S_k_list,
                 band_indices=band_indices,
                 recip_lattice=self.recip_lattice,

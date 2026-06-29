@@ -90,3 +90,6 @@ external/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Large CRYSTAL output data (not version-controlled)
+calculations/
